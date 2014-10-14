@@ -15,7 +15,6 @@ from theano.gof import local_optimizer
 from theano.gof.opt import Optimizer
 from theano.gradient import DisconnectedType
 
-
 try:
     import scipy.linalg
     imported_scipy = True
