@@ -15,7 +15,6 @@ from theano.gof.opt import Optimizer
 from theano.gradient import DisconnectedType
 from theano.tensor import basic as tensor
 
-
 class MatrixPinv(Op):
     """Computes the pseudo-inverse of a matrix :math:`A`.
 
@@ -46,7 +45,6 @@ class MatrixPinv(Op):
         z[0] = numpy.linalg.pinv(x).astype(x.dtype)
 
 pinv = MatrixPinv()
-
 
 class MatrixInverse(Op):
     """Computes the inverse of a matrix :math:`A`.

@@ -4,10 +4,9 @@ logger = logging.getLogger(__name__)
 import numpy
 
 from theano.gof import Op, Apply
-
+from theano import tensor
 from theano.tensor import as_tensor_variable, dot, DimShuffle, Dot
 from theano.tensor.blas import Dot22
-from theano import tensor
 import theano.tensor
 from theano.tensor.opt import (register_stabilize,
         register_specialize, register_canonicalize)
@@ -33,6 +32,36 @@ MATRIX_STRUCTURES = (
         'diagonal',
         'toeplitz',
         )
+
+class CholLogDet(Op):
+    """Matrix determinant
+    Input should be a square matrix, PSD
+    """
+    def make_node(self, x):
+        x = as_tensor_variable(x)
+        assert x.ndim == 2
+        o = theano.tensor.scalar(dtype=x.dtype)
+        return Apply(self, [x], [o])
+
+    def perform(self, node, (x,), (z, )):
+        try:
+            z[0] = numpy.asarray(2*numpy.log(numpy.diag(numpy.linalg.cholesky(x))).sum(), dtype=x.dtype)
+        except Exception:
+            print 'Failed to compute determinant', x
+            raise
+
+    def grad(self, inputs, g_outputs):
+        X, = inputs
+        gz, = g_outputs
+        N, _ = X.shape
+        return [solve(X.T, theano.tensor.eye(N), sym_pos=True) * gz ]
+
+    def infer_shape(self, node, shapes):
+        return [()]
+
+    def __str__(self):
+        return "Det"
+chollogdet = CholLogDet()
 
 class Cholesky(Op):
     """
@@ -170,7 +199,7 @@ class Solve(Op):
         return (type(self) == type(other) and self.sym_pos == other.sym_pos and
                 self.lower == other.lower and
                 self.overwrite_a == other.overwrite_a and
-                self.overwrite_b == other.overwite_b)
+                self.overwrite_b == other.overwrite_b)
 
     def __hash__(self):
         return (hash(type(self)) ^ hash(self.sym_pos) ^ hash(self.lower) ^
@@ -196,9 +225,9 @@ class Solve(Op):
         b = tensor.as_tensor_variable(b)
         if a.ndim != 2 or  b.ndim > 2 or b.ndim == 0:
             raise TypeError('%s: inputs have improper dimensions:\n'
-                    '\'a\' must have two,'
-                    ' \'b\' must have either one or two' %
-                            self.__class__.__name__)
+                    '\'a\' must have two and has %d,'
+                    ' \'b\' must have either one or two and has %d' %
+                            (self.__class__.__name__, a.ndim, b.ndim))
 
         out_type = tensor.TensorType(dtype=(a * b).dtype,
                                      broadcastable=b.type.broadcastable)()
@@ -231,38 +260,13 @@ class Solve(Op):
         around the row-vectorizations of inputs 'a' and 'b'.
         """
 
-        a, b = inputs
-        ingrad = cost_grad
+        A, b = inputs
+        b = b
+        ingrad = cost_grad[0]
         ingrad = tensor.as_tensor_variable(ingrad)
-        if self.sym_pos:
-            inv_a = solve(a, numpy.eye(a), self.sym_pos)
-        else:
-            inv_a = matrix_inverse(a)
-
-        if b.ndim == 1:
-            prod_a_b = tensor.tensordot(-b.T, inv_a.T, axes=1)
-            prod_a_b = tensor.shape_padleft(prod_a_b)
-            jac_veca = kron(inv_a, prod_a_b)
-            jac_b = inv_a
-            outgrad_veca = tensor.tensordot(ingrad, jac_veca, axes=1)
-            outgrad_a = tensor.reshape(outgrad_veca,
-                        (inputs[0].shape[0], inputs[0].shape[0]))
-            outgrad_b = tensor.tensordot(ingrad, jac_b, axes=1).flatten(ndim=1)
-
-        else:
-            ingrad_vec = ingrad.flatten(ndim=1)
-            prod_a_b = tensor.tensordot(-b.T, inv_a.T, axes=1)
-            jac_veca = kron(inv_a, prod_a_b)
-            I_N = tensor.eye(tensor.shape(inputs[1])[1],
-                             tensor.shape(inputs[1])[1])
-            jac_vecb = kron(inv_a, I_N)
-            outgrad_veca = tensor.tensordot(ingrad_vec, jac_veca, axes=1)
-            outgrad_a = tensor.reshape(outgrad_veca,
-                        (inputs[0].shape[0], inputs[0].shape[0]))
-            outgrad_vecb = tensor.tensordot(ingrad_vec, jac_vecb, axes=1)
-            outgrad_b = tensor.reshape(outgrad_vecb,
-                        (inputs[1].shape[0], inputs[1].shape[1]))
-
+        N, _ = A.shape
+        outgrad_a = -solve(A, b).dot(solve(A, ingrad).T).T
+        outgrad_b = ingrad.T.dot(solve(A, tensor.eye(N))).T
         return [outgrad_a, outgrad_b]
 
 
