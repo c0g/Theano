@@ -19,6 +19,8 @@ import theano.compile.mode
 from theano.compile.io import (
     In, SymbolicInput, SymbolicInputKit, SymbolicOutput)
 from theano.compile.ops import deep_copy_op, view_op
+from theano.gof.graph import is_same_graph
+from theano.gof.op import ops_with_inner_function
 
 import logging
 _logger = logging.getLogger('theano.compile.function_module')
@@ -295,6 +297,7 @@ class Function(object):
         self.profile = None  # reassigned in FunctionMaker.create
         self.trust_input = False  # If True, we don't check the input parameter
         self.name = None
+        self.nodes_with_inner_function = []
 
         # We will be popping stuff off this `containers` object.  It is a copy.
         containers = list(self.input_storage)
@@ -451,6 +454,10 @@ class Function(object):
             if input.update is not None:
                 self.n_returned_outputs -= 1
 
+        for node in self.maker.fgraph.apply_nodes:
+            if node.op in ops_with_inner_function.keys():
+                self.nodes_with_inner_function.append(node.op)
+
     def __contains__(self, item):
         return self.value.__contains__(item)
 
@@ -595,13 +602,15 @@ class Function(object):
                     # For the CVM
                     gof.link.raise_with_op(
                         self.fn.nodes[self.fn.position_of_error],
-                        self.fn.thunks[self.fn.position_of_error])
+                        self.fn.thunks[self.fn.position_of_error],
+                        storage_map=self.fn.storage_map)
                 else:
                     # For the c linker We don't have access from
                     # python to all the temps values So for now, we
                     # just don't print the extra shapes/strides info
-                    gof.vm.raise_with_op(
-                        self.fn.nodes[self.fn.position_of_error])
+                    gof.link.raise_with_op(
+                        self.fn.nodes[self.fn.position_of_error],
+                        storage_map=self.fn.storage_map)
             else:
                 # old-style linkers raise their own exceptions
                 raise
@@ -678,8 +687,22 @@ class Function(object):
         None,  # this property itself is not settable
         doc="""dictionary-like access to the containers associated with Variables""")
 
-# pickling/deepcopy support for Function
 
+    def free(self):
+        """
+        When allow_gc = False, clear the Variables in storage_map
+        """
+        # 1.no allow_gc return False 2.has allow_gc, if allow_gc is False, return True
+        if not getattr(self.fn, 'allow_gc', True):
+            for key in self.fn.storage_map.keys():
+                if not isinstance(key, theano.gof.Constant):
+                    self.fn.storage_map[key][0] = None
+            
+            for node in self.nodes_with_inner_function:
+                ops_with_inner_function[node.op].free()
+
+
+# pickling/deepcopy support for Function
 
 def _pickle_Function(f):
     #copy of the input storage list
@@ -715,7 +738,6 @@ def _pickle_Function(f):
                                     ' operation') %(str(d_i), str(d_j)))
                         else:
                             raise AliasedMemoryError(d_i, d_j)
-
     rval = (_constructor_Function, (f.maker, input_storage, inputs_data))
     return rval
 
@@ -948,10 +970,175 @@ class FunctionMaker(object):
             return SymbolicOutput(output)
         else:
             raise TypeError("Unknown output type: %s (%s)", type(output), output)
+        
+    def optimize_graph_with_cache(self, optimizer, inputs, outputs):
+        # This function is not finished
+        from theano.gof.compilelock import get_lock, release_lock
+        import os.path
 
+        graph_db_file = os.path.join(theano.config.compiledir, 'optimized_graphs.pkl')
+
+        # the inputs, outputs, and size of the graph to be optimized
+        inputs_new = [inp.variable for inp in inputs]
+        outputs_new = [out.variable for out in outputs]
+        size_new = len(self.fgraph.apply_nodes)
+        need_optimize = False
+        get_lock()
+        key = None
+        #Beginning of cache optimizations.
+        #Could be refactored in different functions.
+        def load_graph_db():
+            if os.path.isfile(graph_db_file):
+                print 'graph_db already exists'
+            else:
+                # create graph_db
+                f = open(graph_db_file, 'wb')
+                print 'create new graph_db in %s' % graph_db_file
+                #file needs to be open and closed for every pickle
+                f.close()
+            # load the graph_db dictionary
+            try:
+                f = open(graph_db_file, 'rb')
+                #Temporary hack to allow theano.scan_module.tests.test_scan.T_Scan
+                #to finish. Should be changed in definitive version.
+                tmp = theano.config.unpickle_function
+                theano.config.unpickle_function = False
+                graph_db = cPickle.load(f)
+                
+                #hack end
+                f.close()
+                print 'graph_db loaded and it is not empty'
+            except EOFError, e:
+                # the file has nothing in it
+                print e
+                print 'graph_db loaded and it is empty'
+                graph_db = {}
+            finally:
+                theano.config.unpickle_function = tmp
+                
+            return graph_db
+
+        def find_same_graph_in_db(graph_db):
+            # If found_graph_in_db is None, then need to optimize.
+            # Otherwise, return the graph found.
+            found_graph_in_db = None
+            # The sole purpose of this loop is to set 'need_optimize' by
+            # going through graph_db, looking for graph that has the same
+            # computation performed. 
+            for graph_old, graph_optimized in graph_db.iteritems():
+                inputs_old = graph_old.inputs
+                outputs_old = graph_old.outputs
+                size_old = len(graph_old.apply_nodes)
+                # Some heuristics to check is the same graphs have
+                # already been optimized before.
+                if len(inputs_new) != len(inputs_old):
+                    # If the inputs are of different size,
+                    # two graphs are for sure different
+                    print 'need to optimize, because input size is different'
+                    continue
+                elif len(outputs_new) != len(outputs_old):
+                    # If the inputs are of different size,
+                    # two graphs are for sure different
+                    print 'need to optimize, because output size is different'
+                    continue
+                elif not all(input_new.type == input_old.type for
+                             input_new, input_old in zip(inputs_new, inputs_old)):
+                    print 'need to optimize, because inputs are of different types'
+                    continue
+                elif not all(output_new.type == output_old.type for
+                             output_new, output_old in zip(outputs_new, outputs_old)):
+                    print 'need to optimize, because outputs are of different types'
+                    continue
+                elif not size_old == size_new:
+                    print 'need to optimize, because numbers of nodes in graph are different'
+                    continue
+                else:
+                    flags = []
+                    for output_new, output_old, i in zip(
+                            outputs_new, outputs_old, range(len(outputs_new))):
+                        print 'loop through outputs node for both graphs'
+                        graph_old.variables = set(gof.graph.variables(
+                            graph_old.inputs, graph_old.outputs))
+
+                        #using clone allowed to avoid a lot of errors
+                        #deep copy seemed to had.
+                        f2 = graph_old.clone(check_integrity=False)
+                        t1 = output_new
+                        t2 = f2.outputs[i]
+
+                        #Used to remove "already used by another graph error
+                        def removeAllFgraph(remove):
+                            if hasattr(remove, 'fgraph'):
+                                del remove.fgraph
+                            if hasattr(remove, 'owner'):
+                                if remove.owner is None:
+                                    pass
+                                else:
+                                    if hasattr(remove.owner, 'fgraph'):
+                                        del remove.owner.fgraph
+                                    if hasattr(remove.owner, 'inputs'):
+                                        remove.owner.inputs = [removeAllFgraph(
+                                            i) for i in remove.owner.inputs]
+                                        for o in remove.owner.outputs:
+                                            if hasattr(o, 'fgraph'):
+                                                del o.fgraph
+                            return remove
+
+                        t2 = removeAllFgraph(t2)
+
+                        givens = dict(zip(gof.graph.inputs([t1]),
+                                        gof.graph.inputs([t2])))
+
+                        temp = dict(zip(gof.graph.inputs([t1]),
+                                    gof.graph.inputs([t2])))
+
+                        #hack to remove inconstent entry in givens
+                        #seems to work that but source of inconsistency
+                        #could be worth investigating.
+                        for key, value in temp.iteritems():
+                            if key.type != value.type:
+                                del givens[key]
+
+                        flag = is_same_graph(t1, t2, givens=givens)
+
+                        flags.append(flag)
+
+                    is_same = all(flags)
+                    if is_same:
+                        # found the match
+                        print 'found a match, no need to optimize'
+                        found_graph_in_db = graph_optimized
+                        break
+            return found_graph_in_db
+                   
+        graph_db = load_graph_db()
+        print 'loaded graph_db from %s, size=%d' % (graph_db_file, len(graph_db))
+        found_graph = find_same_graph_in_db(graph_db)
+        if found_graph:
+            self.fgraph = found_graph
+            optimizer_profile = None
+        else:
+            # this is a brand new graph, optimize it, save it to graph_db
+            print 'graph not found in graph_db, optimizing the graph'
+            self.fgraph.variables = set(gof.graph.variables(
+                self.fgraph.inputs, self.fgraph.outputs))
+            #check_integrity parameters was added to ignore 
+            #"excess cached variables" errors. Works that way
+            #but once again the error couldbe worth
+            #investigating.
+            before_opt = self.fgraph.clone(check_integrity=False)
+            optimizer_profile = optimizer(self.fgraph)
+            graph_db.update({before_opt:self.fgraph})
+            f = open(graph_db_file, 'wb')
+            cPickle.dump(graph_db, f, -1)
+            f.close()
+            print 'new graph saved into graph_db'
+        release_lock()
+        return optimizer_profile
+                
     def __init__(self, inputs, outputs,
             mode=None, accept_inplace=False, function_builder=Function,
-            profile=None, on_unused_input=None):
+            profile=None, on_unused_input=None, fgraph=None):
         """
         :type inputs: a list of SymbolicInput instances
 
@@ -991,20 +1178,22 @@ class FunctionMaker(object):
             # 1) We preload the cache here to don't have its timming
             #    included in optimization that compile function.
             # 2) If other repo that import Theano have Theano ops defined,
-            #    we need to refresh the cache here. Otherwise, their is import
+            #    we need to refresh the cache here. Otherwise, there are import
             #    order problems.
-            #    When device=gpu, we compile during Theano import. This trigger
-            #    the loading of the cache. But unpickling the cache ask that the
-            #    other repos Ops are completly loaded, which isn't always the
-            #    case!
-            #    If a module isn't completly loaded and their unpickling fail,
-            #    it mean it is safe for this function compilation to skip them,
-            #    but not for futur compilation. So reloading the cache at each
-            #    compilation fix this problem.
-            # 3) This help propagate knowledge of newly compiled module to
-            #    concurrent process.
+            #    When device=gpu, we compile during Theano
+            #    import. This triggers the loading of the cache. But
+            #    unpickling the cache asks that the external Ops are
+            #    completly loaded, which isn't always the case!
+            #    If a module isn't completly loaded and its unpickling
+            #    fails, it means it is safe for this function
+            #    compilation to skip them, but not for future
+            #    compilations. So reloading the cache at each
+            #    compilation fixes this problem.
+            # 3) This helps propagate knowledge of newly compiled modules to
+            #    concurrent processes.
             theano.gof.cc.get_module_cache().refresh()
-        # Handle the case where inputs and/or outputs is a single Variable (not in a list)
+        # Handle the case where inputs and/or outputs is a single
+        # Variable (not in a list)
         self.orig_outputs = outputs
         unpack_single = False
         return_none = False
@@ -1018,7 +1207,6 @@ class FunctionMaker(object):
             inputs = [inputs]
 
         # Wrap them in In or Out instances if needed.
-        #import pudb; pudb.set_trace()
         inputs, outputs = map(self.wrap_in, inputs), map(self.wrap_out, outputs)
         _inputs = gof.graph.inputs([o.variable for o in outputs] + [i.update
             for i in inputs if getattr(i, 'update', False)])
@@ -1030,37 +1218,52 @@ class FunctionMaker(object):
         # tuple for each input. (See Function.indices for more details)
         indices = [[input] + self.expand_in(input, _inputs) for input in inputs]
 
-        # make the fgraph (copies the graph, creates NEW INPUT AND OUTPUT VARIABLES)
-        fgraph, additional_outputs = std_fgraph(inputs, outputs, accept_inplace)
-        fgraph.profile = profile
-
+        if fgraph is None:
+            need_opt = True
+            # make the fgraph (copies the graph, creates NEW INPUT AND OUTPUT VARIABLES)
+            fgraph, additional_outputs = std_fgraph(inputs, outputs, accept_inplace)
+            fgraph.profile = profile
+        else:
+            # fgraph is already an optimized one
+            need_opt = False
+            _, additional_outputs = std_fgraph(inputs, outputs, accept_inplace)
+            pass
+        
         self.fgraph = fgraph
 
         # Fetch the optimizer and linker
         optimizer, linker = mode.optimizer, copy.copy(mode.linker)
+        if need_opt:
+            compute_test_value_orig = theano.config.compute_test_value
+            limit_orig = theano.config.traceback.limit
+            # Why we add stack on node when it get done in output var?
+            try:
+                # optimize the fgraph
+                theano.config.compute_test_value = theano.config.compute_test_value_opt
+                theano.config.traceback.limit = 0
+                start_optimizer = time.time()
 
-        # optimize the fgraph
-        compute_test_value_orig = theano.config.compute_test_value
-        add_stack_trace_on_call = gof.Op.add_stack_trace_on_call
-        try:
-            theano.config.compute_test_value = theano.config.compute_test_value_opt
-            gof.Op.add_stack_trace_on_call = False
-            start_optimizer = time.time()
-            optimizer_profile = optimizer(fgraph)
-            end_optimizer = time.time()
-            opt_time = end_optimizer - start_optimizer
-            if profile:
-                profile.optimizer_time += opt_time
-                if theano.config.profile_optimizer:
-                    profile.optimizer_profile = (optimizer, optimizer_profile)
-            _logger.debug('Optimizing took %f seconds', opt_time)
+                # now optimize the graph
+                if theano.config.cache_optimizations:
+                    optimizer_profile = self.optimize_graph_with_cache(
+                        optimizer, inputs, outputs)
+                else:    
+                    optimizer_profile = optimizer(fgraph)
+                    
+                end_optimizer = time.time()
+                opt_time = end_optimizer - start_optimizer
+                if profile:
+                    profile.optimizer_time += opt_time
+                    if theano.config.profile_optimizer:
+                        profile.optimizer_profile = (optimizer, optimizer_profile)
+                _logger.debug('Optimizing took %f seconds', opt_time)
 
-            #Add deep copy to respect the memory interface
-            insert_deepcopy(fgraph, inputs, outputs + additional_outputs)
-        finally:
-            theano.config.compute_test_value = compute_test_value_orig
-            gof.Op.add_stack_trace_on_call = add_stack_trace_on_call
-
+                #Add deep copy to respect the memory interface
+                insert_deepcopy(fgraph, inputs, outputs + additional_outputs)
+            finally:
+                theano.config.compute_test_value = compute_test_value_orig
+                theano.config.traceback.limit = limit_orig
+        
         # initialize the linker
         if not hasattr(linker, 'accept'):
             raise ValueError("'linker' parameter of FunctionMaker should be a Linker with an accept method " \
@@ -1204,7 +1407,15 @@ class FunctionMaker(object):
 
         # Get a function instance
         start_linker = time.time()
-        _fn, _i, _o = self.linker.make_thunk(input_storage=input_storage_lists)
+        start_import_time = theano.gof.cmodule.import_time
+        limit_orig = theano.config.traceback.limit
+        try:
+            theano.config.traceback.limit = 0
+            _fn, _i, _o = self.linker.make_thunk(
+                input_storage=input_storage_lists)
+        finally:
+            theano.config.traceback.limit = limit_orig
+
         end_linker = time.time()
 
         linker_time = end_linker - start_linker
@@ -1212,6 +1423,8 @@ class FunctionMaker(object):
         if self.profile:
             self.profile.linker_time += linker_time
             _fn.time_thunks = self.profile.flag_time_thunks
+            import_time = theano.gof.cmodule.import_time - start_import_time
+            self.profile.import_time += import_time
 
         fn = self.function_builder(_fn, _i, _o, self.indices, self.outputs,
                 defaults, self.unpack_single, self.return_none, self)
@@ -1223,6 +1436,7 @@ def _pickle_FunctionMaker(self):
     kwargs = dict(
                 inputs=self.inputs,
                 outputs=self.orig_outputs,
+                fgraph=self.fgraph,
                 mode=self.mode,
                 accept_inplace=self.accept_inplace,
                 function_builder=self.function_builder,
@@ -1234,6 +1448,8 @@ def _pickle_FunctionMaker(self):
 
 def _constructor_FunctionMaker(kwargs):
     if theano.config.unpickle_function:
+        if theano.config.reoptimize_unpickled_function:
+            del kwargs['fgraph']
         return FunctionMaker(**kwargs)
     else:
         return None
@@ -1343,6 +1559,7 @@ def orig_function(inputs, outputs, mode=None, accept_inplace=False,
     t2 = time.time()
     if profile:
         profile.compile_time += t2 - t1
+        profile.nb_nodes = len(fn.maker.fgraph.apply_nodes)
 
     fn.name = name
     fn.maker.fgraph.name = name

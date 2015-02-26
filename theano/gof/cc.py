@@ -342,8 +342,19 @@ def get_c_extract(r, name, sub):
     """Wrapper around c_extract that initializes py_name from storage."""
     if any([getattr(c.op, 'check_input', config.check_input) for (c, _) in
             r.clients]):
-
-        c_extract = r.type.c_extract(name, sub, True)
+        # check_broadcast is just an hack to easily remove just the
+        # broadcast check on the old GPU back-end. This check isn't
+        # done in the new GPU back-end or on the CPU.
+        if any([getattr(c.op, 'check_broadcast', True) for (c, _) in
+                r.clients]):
+            c_extract = r.type.c_extract(name, sub, True)
+        else:
+            try:
+                c_extract = r.type.c_extract(
+                    name, sub, True,
+                    check_broadcast=False)
+            except TypeError, e:
+                c_extract = r.type.c_extract(name, sub, True)
     else:
         c_extract = r.type.c_extract(name, sub, False)
 
@@ -356,8 +367,18 @@ def get_c_extract(r, name, sub):
 
 def get_c_extract_out(r, name, sub):
     """Wrapper around c_extract_out that initializes py_name from storage."""
-    c_extract = r.type.c_extract_out(name, sub,
-                    getattr(r.owner.op, 'check_input', config.check_input))
+    # check_broadcast is just an hack to easily remove just the
+    # broadcast check on the old GPU back-end. This check isn't
+    # done in the new GPU back-end or on the CPU.
+    check_input = getattr(r.owner.op, 'check_input', config.check_input)
+    if getattr(r.owner.op, 'check_broadcast', True):
+        c_extract = r.type.c_extract_out(name, sub, check_input)
+    else:
+        try:
+            c_extract = r.type.c_extract_out(name, sub, check_input,
+                                             check_broadcast=False)
+        except TypeError, e:
+            c_extract = r.type.c_extract_out(name, sub, check_input)
 
     pre = """
     py_%(name)s = PyList_GET_ITEM(storage_%(name)s, 0);
@@ -482,11 +503,31 @@ class CLinker(link.Linker):
         self.inputs = fgraph.inputs
         self.outputs = fgraph.outputs
 
+        self.node_order = self.schedule(fgraph)
+
         # list(fgraph.variables)
-        # We need to include the not used inputs in our variables,
+        # We need to include the unused inputs in our variables,
         # otherwise we can't pass them to the module.
         self.variables = [var for var in self.inputs if not len(var.clients)]
         self.variables += graph.variables(self.inputs, self.outputs)
+
+        # This adds a hidden input which is the context for each node
+        # that needs it
+        self.contexts = dict()
+        for node in self.node_order:
+            ctx = node.run_context()
+            if ctx is not graph.NoContext:
+                # try to avoid creating more than one variable for the
+                # same context.
+                if ctx in self.contexts:
+                    var = self.contexts[ctx]
+                    assert var.type == node.context_type
+                    var.clients.append((node, 'context'))
+                else:
+                    var = graph.Constant(node.context_type, ctx)
+                    var.clients = [(node, 'context')]
+                    self.contexts[ctx] = var
+                    self.variables.append(var)
 
         # The orphans field is listified to ensure a consistent order.
         #list(fgraph.orphans.difference(self.outputs))
@@ -496,7 +537,6 @@ class CLinker(link.Linker):
         self.temps = list(set(self.variables).difference(
                 self.inputs).difference(self.outputs).difference(self.orphans))
         self.consts = []
-        self.node_order = self.schedule(fgraph)
 
     def code_gen(self):
         """WRITEME
@@ -621,8 +661,12 @@ class CLinker(link.Linker):
             id += 2
 
         for node_num, node in enumerate(self.node_order):
-            # Why is this here?
+
             sub = dict(failure_var=failure_var)
+
+            ctx = node.run_context()
+            if ctx is not graph.NoContext:
+                context_var = symbol[self.contexts[ctx]]
 
             # The placeholder will be replaced by a hash of the entire
             # code (module + support code) in DynamicModule.code.
@@ -637,12 +681,17 @@ class CLinker(link.Linker):
 
             # Make the CodeBlock for c_code
             sub['id'] = id
-            sub['struct_id'] = id + 1
             sub['fail'] = failure_code(sub)
+            if ctx is not graph.NoContext:
+                sub['context'] = context_var
 
             sub_struct = dict()
             sub_struct['id'] = id + 1
             sub_struct['fail'] = failure_code_init(sub)
+            if ctx is not graph.NoContext:
+                # Since context inputs are always constants they are
+                # guaranteed to be available in the struct init code.
+                sub_struct['context'] = context_var
 
             struct_support = ""
             struct_init = ""
@@ -671,7 +720,7 @@ class CLinker(link.Linker):
                     " didn't return a string for c_init_code_apply")
 
             try:
-                struct_init = op.c_init_code_struct(node, id + 1, sub_struct)
+                struct_init = op.c_init_code_struct(node, name, sub_struct)
                 assert isinstance(struct_init, basestring), (
                     str(node.op) +
                     " didn't return a string for c_init_code_struct")
@@ -679,7 +728,7 @@ class CLinker(link.Linker):
                 pass
 
             try:
-                struct_support = op.c_support_code_struct(node, id + 1)
+                struct_support = op.c_support_code_struct(node, name)
                 assert isinstance(struct_support, basestring), (
                     str(node.op) +
                     " didn't return a string for c_support_code_struct")
@@ -687,7 +736,7 @@ class CLinker(link.Linker):
                 pass
 
             try:
-                struct_cleanup = op.c_cleanup_code_struct(node, id + 1)
+                struct_cleanup = op.c_cleanup_code_struct(node, name)
                 assert isinstance(struct_cleanup, basestring), (
                     str(node.op) +
                     " didn't return a string for c_cleanup_code_struct")
@@ -1261,30 +1310,18 @@ class CLinker(link.Linker):
                 return ((), sig)
         return version, sig
 
+    def get_src_code(self):
+        mod = self.get_dynamic_module()
+        return mod.code()
+
     def compile_cmodule(self, location=None):
         """
-        Compile the module and return it.
-        """
-        # Go through all steps of the compilation process.
-        for step_result in self.compile_cmodule_by_step(location=location):
-            pass
-        # And return the output of the last step, which should be the module
-        # itself.
-        return step_result
-
-    def compile_cmodule_by_step(self, location=None):
-        """
-        This method is a callback for `ModuleCache.module_from_key`.
-
-        It is a generator (thus the 'by step'), so that:
-            - it first yields the module's C code
-            - it last yields the module itself
-            - it may yield other intermediate outputs in-between if needed
-              in the future (but this is not currently the case)
+        This compiles the source code for this linker and returns a
+        loaded module.
         """
         if location is None:
             location = cmodule.dlimport_workdir(config.compiledir)
-        mod = self.build_dynamic_module()
+        mod = self.get_dynamic_module()
         c_compiler = self.c_compiler()
         libs = self.libraries()
         preargs = self.compile_args()
@@ -1303,48 +1340,49 @@ class CLinker(link.Linker):
             if 'amdlibm' in libs:
                 libs.remove('amdlibm')
         src_code = mod.code()
-        yield src_code
         get_lock()
         try:
             _logger.debug("LOCATION %s", str(location))
-            try:
-                module = c_compiler.compile_str(
-                    module_name=mod.code_hash,
-                    src_code=src_code,
-                    location=location,
-                    include_dirs=self.header_dirs(),
-                    lib_dirs=self.lib_dirs(),
-                    libs=libs,
-                    preargs=preargs)
-            except Exception, e:
-                e.args += (str(self.fgraph),)
-                raise
+            module = c_compiler.compile_str(
+                module_name=mod.code_hash,
+                src_code=mod.code(),
+                location=location,
+                include_dirs=self.header_dirs(),
+                lib_dirs=self.lib_dirs(),
+                libs=libs,
+                preargs=preargs)
+        except Exception, e:
+            e.args += (str(self.fgraph),)
+            raise
         finally:
             release_lock()
+        return module
 
-        yield module
-
-    def build_dynamic_module(self):
+    def get_dynamic_module(self):
         """Return a cmodule.DynamicModule instance full of the code
         for our fgraph.
+
+        This method is cached on the first call so it can be called
+        multiple times without penalty.
         """
-        self.code_gen()
+        if not hasattr(self, '_mod'):
+            self.code_gen()
 
-        mod = cmodule.DynamicModule()
+            mod = cmodule.DynamicModule()
 
-        # The code of instantiate
-        # the 1 is for error_storage
-        code = self.instantiate_code(1 + len(self.args))
-        instantiate = cmodule.ExtFunction('instantiate', code,
-                                          method=cmodule.METH_VARARGS)
+            # The code of instantiate
+            # the 1 is for error_storage
+            code = self.instantiate_code(1 + len(self.args))
+            instantiate = cmodule.ExtFunction('instantiate', code,
+                                              method=cmodule.METH_VARARGS)
                 #['error_storage'] + argnames,
                 #local_dict = d,
                 #global_dict = {})
 
-        # Static methods that can run and destroy the struct built by
-        # instantiate.
-        if PY3:
-            static = """
+            # Static methods that can run and destroy the struct built by
+            # instantiate.
+            if PY3:
+                static = """
         static int {struct_name}_executor({struct_name} *self) {{
             return self->run();
         }}
@@ -1354,8 +1392,8 @@ class CLinker(link.Linker):
             delete self;
         }}
         """.format(struct_name=self.struct_name)
-        else:
-            static = """
+            else:
+                static = """
         static int %(struct_name)s_executor(%(struct_name)s* self) {
             return self->run();
         }
@@ -1366,17 +1404,17 @@ class CLinker(link.Linker):
         """ % dict(struct_name=self.struct_name)
 
         # We add all the support code, compile args, headers and libs we need.
-        for support_code in self.support_code() + self.c_support_code_apply:
-            mod.add_support_code(support_code)
-        mod.add_support_code(self.struct_code)
-        mod.add_support_code(static)
-        mod.add_function(instantiate)
-        for header in self.headers():
-            mod.add_include(header)
-        for init_code_block in self.init_code() + self.c_init_code_apply:
-            mod.add_init_code(init_code_block)
-
-        return mod
+            for support_code in self.support_code() + self.c_support_code_apply:
+                mod.add_support_code(support_code)
+            mod.add_support_code(self.struct_code)
+            mod.add_support_code(static)
+            mod.add_function(instantiate)
+            for header in self.headers():
+                mod.add_include(header)
+            for init_code_block in self.init_code() + self.c_init_code_apply:
+                mod.add_init_code(init_code_block)
+            self._mod = mod
+        return self._mod
 
     def cthunk_factory(self, error_storage, in_storage, out_storage,
                        keep_lock=False):
@@ -1400,7 +1438,7 @@ class CLinker(link.Linker):
             module = self.compile_cmodule()
         else:
             module = get_module_cache().module_from_key(
-                key=key, fn=self.compile_cmodule_by_step, keep_lock=keep_lock)
+                key=key, lnk=self, keep_lock=keep_lock)
 
         vars = self.inputs + self.outputs + self.orphans
         # List of indices that should be ignored when passing the arguments
@@ -1413,8 +1451,8 @@ class CLinker(link.Linker):
         in_storage = [x for i, x in enumerate(in_storage) if i not in dupidx]
         orphd = [[orphan.data] for orphan in self.orphans]
 
-        ret = module.instantiate(error_storage, *(in_storage + out_storage +
-                                                  orphd))
+        ret = module.instantiate(error_storage,
+                                 *(in_storage + out_storage + orphd))
 
         return ret
 

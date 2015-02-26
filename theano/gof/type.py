@@ -307,8 +307,7 @@ class PureType(object):
     def make_constant(self, value, name=None):
         return self.Constant(type=self, data=value, name=name)
 
-
-    def __call__(self, name = None):
+    def __call__(self, name=None):
         """Return a new `Variable` instance of Type `self`.
 
         :Parameters:
@@ -395,6 +394,23 @@ class Type(object2, PureType, CLinkerType):
     types.  Type references are also useful to do type-checking in pattern-based optimizations.
 
     """
+    def convert_variable(self, var):
+        """Patch variable so that its type will match self, if possible.
+
+        If the variable can't be converted, this should return None.
+
+        The conversion can only happen if the following implication is
+        true for all possible `val`.
+
+          self.is_valid_value(val) => var.type.is_valid_value(val)
+
+        For the majority of types this means that you can only have
+        non-broadcastable dimensions become broadcastable and not the
+        inverse.
+
+        The default is to not convert anything which is always safe.
+        """
+        return None
 
 
 class SingletonType(Type):
@@ -416,6 +432,19 @@ class SingletonType(Type):
 
     def __str__(self):
         return self.__class__.__name__
+
+    # even if we try to make a singleton, this do not always work.  So
+    # we compare the type. See test_type_other.test_none_Constant for
+    # an exmple. So we need to implement __eq__ and __hash__
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if type(self) is type(other):
+            return True
+        return False
+
+    def __hash__(self):
+        return hash(type(self))
 
 
 class Generic(SingletonType):
@@ -479,6 +508,15 @@ class CDataType(Type):
     Represents opaque C data to be passed around. The intent is to
     ease passing arbitrary data between ops C code.
     """
+    import ctypes
+    if PY3:
+        _cdata_type = ctypes.py_object.from_address(
+            ctypes.addressof(ctypes.pythonapi.PyCapsule_Type)).value
+    else:
+        _cdata_type = ctypes.py_object.from_address(
+            ctypes.addressof(ctypes.pythonapi.PyCObject_Type)).value
+    del ctypes
+
     def __init__(self, ctype, freefunc=None):
         """
         Build a type made to represent a C pointer in theano.
@@ -504,11 +542,9 @@ class CDataType(Type):
         return hash((type(self), self.ctype, self.freefunc))
 
     def filter(self, data, strict=False, allow_downcast=None):
-        if data is not None:
-            raise TypeError("only None is valid")
-
-    def is_valid_value(self, a):
-        return a is None
+        if data is not None and not isinstance(data, self._cdata_type):
+            raise TypeError("expected None or PyCObject/PyCapsule")
+        return data
 
     def c_declare(self, name, sub, check_input=True):
         return """
@@ -558,7 +594,7 @@ if (%(name)s == NULL) {
   py_%(name)s = PyCapsule_New((void *)%(name)s, NULL,
                               _py3_destructor);
   if (py_%(name)s != NULL) {
-    if (PyCaspule_SetContext(py_%(name)s, (void *)%(freefunc)s) != 0) {
+    if (PyCapsule_SetContext(py_%(name)s, (void *)%(freefunc)s) != 0) {
       /* This won't trigger a call to freefunc since it could not be
          set. The error case below will do it. */
       Py_DECREF(py_%(name)s);
@@ -588,3 +624,14 @@ if (py_%(name)s == NULL) { %(freefunc)s(%(name)s); }
 
     def __str__(self):
         return "%s{%s}" % (self.__class__.__name__, self.ctype)
+
+
+class CDataTypeConstant(graph.Constant):
+    def signature(self):
+        # The Op.c_code* methoss can't access the data, so it can't
+        # change the code depending of it. So there is no need to put
+        # it in the signature. Also, under Python 2, PyCObject aren't
+        # pickable. So using the PyCObject in the signature would
+        # disable the c code cache for op that have it as an input.
+        return (self.type,)
+CDataType.Constant = CDataTypeConstant

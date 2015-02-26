@@ -1,18 +1,70 @@
-import re
+import linecache
 import traceback
+import re
+import sys
 
 from theano import config
 
 
-def add_tag_trace(thing):
+def simple_extract_stack(f=None, limit=None):
+    """This is traceback.extract_stack from python 2.7 with this
+    change:
+
+    - Comment the update of the cache
+
+    This is because this update cause an call to os.stat to get the
+    line content. This cause too much long on cluster.
+
+    """
+    if f is None:
+        try:
+            raise ZeroDivisionError
+        except ZeroDivisionError:
+            f = sys.exc_info()[2].tb_frame.f_back
+    if limit is None:
+        if hasattr(sys, 'tracebacklimit'):
+            limit = sys.tracebacklimit
+    list = []
+    n = 0
+    while f is not None and (limit is None or n < limit):
+        lineno = f.f_lineno
+        co = f.f_code
+        filename = co.co_filename
+        name = co.co_name
+#        linecache.checkcache(filename)
+        line = linecache.getline(filename, lineno, f.f_globals)
+        if line:
+            line = line.strip()
+        else:
+            line = None
+        list.append((filename, lineno, name, line))
+        f = f.f_back
+        n = n + 1
+    list.reverse()
+    return list
+
+if sys.version_info[:2] > (3, 4):
+    # I enable my implementation only for some python version just to
+    # be sure the Python internal do not change. If this work with
+    # other python version, you can enable it.
+    simple_extract_stack = traceback.extract_stack
+
+
+def add_tag_trace(thing, user_line=1):
     """Add tag.trace to an node or variable.
 
     The argument is returned after being affected (inplace).
+    :param thing: the object where we add .tag.trace
+    :param user_line: The max number of user line to keep.
+
+    :note: we alse use config.traceback.limit for the maximum number
+        of stack level we look.
+
     """
     limit = config.traceback.limit
     if limit == -1:
         limit = None
-    tr = traceback.extract_stack(limit=limit)[:-1]
+    tr = simple_extract_stack(limit=limit)[:-1]
     # Different python version use different sementic for
     # limit. python 2.7 include the call to extrack_stack. The -1 get
     # rid of it.  We also want to get rid of the add_tag_trace call.
@@ -22,14 +74,21 @@ def add_tag_trace(thing):
         file_path = tr[-1][0]
         rm = False
         for p in ["theano/tensor/",
-                  "theano/gof/"]:
+                  "theano/gof/",
+                  "theano/scalar/basic.py",
+                  "theano/sandbox/",
+                  "theano/scan_module/",
+                  "theano/sparse/",
+                  "theano/typed_list/",
+        ]:
             if p in file_path:
                 tr = tr[:-1]
                 rm = True
                 break
         if not rm:
             break
-
+    if len(tr) > user_line:
+        tr = tr[:user_line]
     thing.tag.trace = tr
     return thing
 
@@ -37,6 +96,11 @@ def add_tag_trace(thing):
 def hashtype(self):
     t = type(self)
     return hash(t.__name__) ^ hash(t.__module__)
+
+
+# Object to mark that a parameter is undefined (useful in cases where
+# None is a valid value with defined semantics)
+undef = object()
 
 
 class MethodNotDefined(Exception):

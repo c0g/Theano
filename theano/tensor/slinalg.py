@@ -2,18 +2,19 @@ import logging
 
 logger = logging.getLogger(__name__)
 import numpy
+import warnings
 
 from theano.gof import Op, Apply
-from theano import tensor
+
 from theano.tensor import as_tensor_variable, dot, DimShuffle, Dot
 from theano.tensor.blas import Dot22
+from theano import tensor
 import theano.tensor
 from theano.tensor.opt import (register_stabilize,
         register_specialize, register_canonicalize)
 from theano.gof import local_optimizer
 from theano.gof.opt import Optimizer
 from theano.gradient import DisconnectedType
-
 
 try:
     import scipy.linalg
@@ -32,36 +33,6 @@ MATRIX_STRUCTURES = (
         'diagonal',
         'toeplitz',
         )
-
-class CholLogDet(Op):
-    """Matrix determinant
-    Input should be a square matrix, PSD
-    """
-    def make_node(self, x):
-        x = as_tensor_variable(x)
-        assert x.ndim == 2
-        o = theano.tensor.scalar(dtype=x.dtype)
-        return Apply(self, [x], [o])
-
-    def perform(self, node, (x,), (z, )):
-        try:
-            z[0] = numpy.asarray(2*numpy.log(numpy.diag(numpy.linalg.cholesky(x))).sum(), dtype=x.dtype)
-        except Exception:
-            print 'Failed to compute determinant', x
-            raise
-
-    def grad(self, inputs, g_outputs):
-        X, = inputs
-        gz, = g_outputs
-        N, _ = X.shape
-        return [solve(X.T, theano.tensor.eye(N), sym_pos=True) * gz ]
-
-    def infer_shape(self, node, shapes):
-        return [()]
-
-    def __str__(self):
-        return "Det"
-chollogdet = CholLogDet()
 
 class Cholesky(Op):
     """
@@ -168,405 +139,65 @@ class CholeskyGrad(Op):
 
 
 class Solve(Op):
-    """
-    Solves the matrix equation a x = b for x.
+    """Solve a system of linear equations"""
 
-    Parameters:
+    __props__ = ('A_structure', 'lower', 'overwrite_A', 'overwrite_b')
 
-    a: array, shape (M, M)
-    b: array, shape (M,) or (M, N)
-    sym_pos: (boolean) Assume a is symmetric and positive definite.
-    lower: (boolean) Use only data contained in the lower triangle of a,
-        if sym_pos is true. Default is to use upper triangle.
-    overwrite_a: (boolean) Allow overwriting data in a (may enhance
-    performance).
-    overwrite_b: (boolean) Allow overwriting data in b (may enhance
-    performance).
-
-    Returns :
-
-    x: array, shape (M,) or (M, N) depending on b
-    """
-
-    def __init__(self, sym_pos=False, lower=False, overwrite_a=False,
+    def __init__(self,
+                 A_structure='general',
+                 lower=False,
+                 overwrite_A=False,
                  overwrite_b=False):
-        self.sym_pos = sym_pos
+        if A_structure not in MATRIX_STRUCTURES:
+            raise ValueError('Invalid matrix structure argument', A_structure)
+        self.A_structure = A_structure
         self.lower = lower
-        self.overwrite_a = overwrite_a
+        self.overwrite_A = overwrite_A
         self.overwrite_b = overwrite_b
 
-    def __eq__(self, other):
-        return (type(self) == type(other) and self.sym_pos == other.sym_pos and
-                self.lower == other.lower and
-                self.overwrite_a == other.overwrite_a and
-                self.overwrite_b == other.overwrite_b)
-
-    def __hash__(self):
-        return (hash(type(self)) ^ hash(self.sym_pos) ^ hash(self.lower) ^
-                hash(self.overwrite_a) ^ hash(self.overwrite_b))
-
-    def props(self):
-        return (self.sym_pos, self.lower, self.overwrite_a, self.overwrite_b)
-
-    def __str__(self):
-        return "%s{%s, %s, %s, %s}" % (self.__class__.__name__,
-                "sym_pos=".join(str(self.sym_pos)),
-                "lower=".join(str(self.lower)),
-                "overwrite_a".join(str(self.overwrite_a)),
-                "overwrite_b=".join(str(self.overwrite_b)))
-
     def __repr__(self):
-        return 'Solve{%s}' % str(self.props())
+        return 'Solve{%s}' % str(self._props())
 
-    def make_node(self, a, b):
+    def make_node(self, A, b):
         assert imported_scipy, (
             "Scipy not available. Scipy is needed for the Solve op")
-        a = tensor.as_tensor_variable(a)
-        b = tensor.as_tensor_variable(b)
-        if a.ndim != 2 or  b.ndim > 2 or b.ndim == 0:
-            raise TypeError('%s: inputs have improper dimensions:\n'
-                    '\'a\' must have two and has %d,'
-                    ' \'b\' must have either one or two and has %d' %
-                            (self.__class__.__name__, a.ndim, b.ndim))
-
-        out_type = tensor.TensorType(dtype=(a * b).dtype,
-                                     broadcastable=b.type.broadcastable)()
-        return Apply(self, [a, b], [out_type])
-
-    def infer_shape(self, node, in_shapes):
-        return [in_shapes[1]]
+        A = as_tensor_variable(A)
+        b = as_tensor_variable(b)
+        assert A.ndim == 2
+        assert b.ndim in [1, 2]
+        otype = tensor.tensor(
+                broadcastable=b.broadcastable,
+                dtype=(A * b).dtype)
+        return Apply(self, [A, b], [otype])
 
     def perform(self, node, inputs, output_storage):
-        a, b = inputs
-
-        if a.shape[0] != a.shape[1] or a.shape[1] != b.shape[0]:
-            raise TypeError('%s: inputs have improper lengths' %
-                            self.__class__.__name__)
-        try:
-            output_storage[0][0] = scipy.linalg.solve(a, b, self.sym_pos,
-                        self.lower, self.overwrite_a, self.overwrite_b)
-        except Exception, e:
-            e.args = e.args + ('array \'a\' might be singular',) 
-            raise 
-
-    def grad(self, inputs, cost_grad):
-        """
-        See The Matrix Reference Manual,
-        Copyright 1998-2011 Mike Brookes, Imperial College, London, UK
-
-        Note: In contrast with the usual mathematical presentation, in order
-        to apply theano's 'reshape' function wich implements row-order
-        (i.e. C order), the differential expressions below have been derived
-        around the row-vectorizations of inputs 'a' and 'b'.
-        """
-
         A, b = inputs
-        b = b
-        ingrad = cost_grad[0]
-        ingrad = tensor.as_tensor_variable(ingrad)
-        N, _ = A.shape
-        outgrad_a = -solve(A, b).dot(solve(A, ingrad).T).T
-        outgrad_b = ingrad.T.dot(solve(A, tensor.eye(N))).T
-        return [outgrad_a, outgrad_b]
+        if self.A_structure == 'lower_triangular':
+            rval = scipy.linalg.solve_triangular(
+                A, b, lower=True)
+        elif self.A_structure == 'upper_triangular':
+            rval = scipy.linalg.solve_triangular(
+                A, b, lower=False)
+        else:
+            rval = scipy.linalg.solve(A, b)
+        output_storage[0][0] = rval
+        
+    # computes shape of x where x = inv(A) * b
+    def infer_shape(self, node, shapes):
+        Ashape, Bshape = shapes
+        rows = Ashape[1]
+        if len(Bshape) == 1:  # b is a Vector
+            return [(rows,)]
+        else:
+            cols = Bshape[1]  # b is a Matrix
+            return [(rows, cols)]
 
+solve = Solve()  # general solve
 
-def solve(a, b, sym_pos=False, lower=False, overwrite_a=False,
-                 overwrite_b=False):
-    localop = Solve(sym_pos, lower, overwrite_a, overwrite_b)
-    return localop(a, b)
+#TODO : SolveTriangular
 
 #TODO: Optimizations to replace multiplication by matrix inverse
-#      with Ops solve() or solve_triangular()
-
-class SolveTriangular(Op):
-    """
-    An instance of this class solves the matrix equation a x = b for x where
-    'a' is triangular.
-
-    Parameters:
-
-    a: array, shape (M, M)
-    b: array, shape (M,) or (M, N)
-    lower: (boolean) Use only data contained in the lower triangle of a,
-        if sym_pos is true. Default is to use upper triangle.
-    unit_diagonal : (boolean) If True, diagonal elements of A are assumed to be
-        1 and will not be referenced.
-    overwrite_b: (boolean) Allow overwriting data in b (may enhance
-        performance).
-
-    Returns :
-
-    x: array, shape (M,) or (M, N) depending on b
-    """
-
-    def __init__(self, lower=False, unit_diagonal=False, overwrite_b=False):
-
-        self.lower = lower
-        self.unit_diagonal = unit_diagonal
-        self.overwrite_b = overwrite_b
-
-    def __eq__(self, other):
-        return (type(self) == type(other) and
-                self.lower == other.lower and
-                self.unit_diagonal == other.unit_diagonal and
-                self.overwrite_b == other.overwrite_b)
-
-    def __hash__(self):
-        return (hash(type(self)) ^ hash(self.lower) ^
-                hash(self.unit_diagonal) ^ hash(self.overwrite_b))
-
-    def props(self):
-        return (self.lower, self.unit_diagonal, self.overwrite_b)
-
-    def __str__(self):
-        return "%s{%s, %s, %s}" % (self.__class__.__name__,
-                "lower=".join(str(self.lower)),
-                "unit_diagonal".join(str(self.unit_diagonal)),
-                "overwrite_b=".join(str(self.overwrite_b)))
-
-    def __repr__(self):
-        return 'SolveTriangular{%s}' % str(self.props())
-
-    def make_node(self, a, b):
-        assert imported_scipy, (
-            "Scipy not available. Scipy is needed for the SolveTriangular op")
-        a = tensor.as_tensor_variable(a)
-        b = tensor.as_tensor_variable(b)
-        if a.ndim != 2 or  b.ndim > 2 or b.ndim == 0:
-            raise TypeError('%s: inputs have improper dimensions:\n'
-                    '\'a\' must have two,'
-                    ' \'b\' must have either one or two' %
-                            self.__class__.__name__)
-
-        out_type = tensor.TensorType(dtype=(a * b).dtype,
-                                     broadcastable=b.type.broadcastable)()
-        return Apply(self, [a, b], [out_type])
-
-    def infer_shape(self, node, in_shapes):
-        return [in_shapes[1]]
-
-    def perform(self, node, inputs, output_storage):
-        a, b = inputs
-        if a.shape[0] != a.shape[1] or a.shape[1] != b.shape[0]:
-            raise TypeError('%s: inputs have improper lengths' %
-                            self.__class__.__name__)
-        try:
-            output_storage[0][0] = scipy.linalg.solve_triangular(a, b,
-                            trans=0, lower=self.lower,
-                       unit_diagonal=self.unit_diagonal,
-                             overwrite_b=self.overwrite_b, debug=False)
-
-        except Exception, e:
-            e.args = e.args + ('array \'a\' might be singular',) 
-            raise 
-
-
-
-        #except:
-        #    raise  Exception('%s: array \'a\' is singular'
-        #                     % self.__class__.__name__)
-
-    def grad(self, inputs, cost_grad):
-        """
-        Notes:
-        1. The gradient is computed under the assumption that perturbations
-        of the input array respect triangularity, i.e. partial derivatives wrt
-        triangular region are zero.
-        2. In contrast with the usual mathematical presentation, in order to
-        apply theano's 'reshape' function wich implements row-order (i.e. C
-        order), the differential expressions below have been derived based on
-        the row-vectorizations of inputs 'a' and 'b'.
-
-        See The Matrix Reference Manual,
-        Copyright 1998-2011 Mike Brookes, Imperial College, London, UK
-        """
-
-        a, b = inputs
-        ingrad = cost_grad
-        ingrad = tensor.as_tensor_variable(ingrad)
-        shp_a = (tensor.shape(inputs[0])[1],
-                               tensor.shape(inputs[0])[1])
-        I_M = tensor.eye(*shp_a)
-        if self.lower:
-            inv_a = solve_triangular(a, I_M, lower=True)
-            tri_M = tril(tensor.ones(shp_a))
-        else:
-            inv_a = solve_triangular(a, I_M, lower=False)
-            tri_M = triu(tensor.ones(shp_a))
-        if b.ndim == 1:
-            prod_a_b = tensor.tensordot(-b.T, inv_a.T, axes=1)
-            prod_a_b = tensor.shape_padleft(prod_a_b)
-            jac_veca = kron(inv_a, prod_a_b)
-            jac_b = inv_a
-            outgrad_veca = tensor.tensordot(ingrad, jac_veca, axes=1)
-            outgrad_a = tensor.reshape(outgrad_veca,
-                        (inputs[0].shape[0], inputs[0].shape[0])) * tri_M
-            outgrad_b = tensor.tensordot(ingrad, jac_b, axes=1).flatten(ndim=1)
-        else:
-            ingrad_vec = ingrad.flatten(ndim=1)
-            prod_a_b = tensor.tensordot(-b.T, inv_a.T, axes=1)
-            jac_veca = kron(inv_a, prod_a_b)
-            I_N = tensor.eye(tensor.shape(inputs[1])[1],
-                               tensor.shape(inputs[1])[1])
-            jac_vecb = kron(inv_a, I_N)
-            outgrad_veca = tensor.tensordot(ingrad_vec, jac_veca, axes=1)
-            outgrad_a = tensor.reshape(outgrad_veca,
-                        (inputs[0].shape[0], inputs[0].shape[0])) * tri_M
-            outgrad_vecb = tensor.tensordot(ingrad_vec, jac_vecb, axes=1)
-            outgrad_b = tensor.reshape(outgrad_vecb,
-                        (inputs[1].shape[0], inputs[1].shape[1]))
-        return [outgrad_a, outgrad_b]
-
-
-def solve_triangular(a, b, lower=False, unit_diagonal=False,
-                             overwrite_b=False):
-    return SolveTriangular(lower=lower, unit_diagonal=unit_diagonal,
-                           overwrite_b=overwrite_b)(a, b)
-
-class SolveTriangular(Op):
-    """
-    An instance of this class solves the matrix equation a x = b for x where
-    'a' is triangular.
-
-    Parameters:
-
-    a: array, shape (M, M)
-    b: array, shape (M,) or (M, N)
-    lower: (boolean) Use only data contained in the lower triangle of a,
-        if sym_pos is true. Default is to use upper triangle.
-    unit_diagonal : (boolean) If True, diagonal elements of A are assumed to be
-        1 and will not be referenced.
-    overwrite_b: (boolean) Allow overwriting data in b (may enhance
-        performance).
-
-    Returns :
-
-    x: array, shape (M,) or (M, N) depending on b
-    """
-
-    def __init__(self, lower=False, unit_diagonal=False, overwrite_b=False):
-
-        self.lower = lower
-        self.unit_diagonal = unit_diagonal
-        self.overwrite_b = overwrite_b
-
-    def __eq__(self, other):
-        return (type(self) == type(other) and
-                self.lower == other.lower and
-                self.unit_diagonal == other.unit_diagonal and
-                self.overwrite_b == other.overwrite_b)
-
-    def __hash__(self):
-        return (hash(type(self)) ^ hash(self.lower) ^
-                hash(self.unit_diagonal) ^ hash(self.overwrite_b))
-
-    def props(self):
-        return (self.lower, self.unit_diagonal, self.overwrite_b)
-
-    def __str__(self):
-        return "%s{%s, %s, %s}" % (self.__class__.__name__,
-                "lower=".join(str(self.lower)),
-                "unit_diagonal".join(str(self.unit_diagonal)),
-                "overwrite_b=".join(str(self.overwrite_b)))
-
-    def __repr__(self):
-        return 'SolveTriangular{%s}' % str(self.props())
-
-    def make_node(self, a, b):
-        assert imported_scipy, (
-            "Scipy not available. Scipy is needed for the SolveTriangular op")
-        a = tensor.as_tensor_variable(a)
-        b = tensor.as_tensor_variable(b)
-        if a.ndim != 2 or  b.ndim > 2 or b.ndim == 0:
-            raise TypeError('%s: inputs have improper dimensions:\n'
-                    '\'a\' must have two,'
-                    ' \'b\' must have either one or two' %
-                            self.__class__.__name__)
-
-        out_type = tensor.TensorType(dtype=(a * b).dtype,
-                                     broadcastable=b.type.broadcastable)()
-        return Apply(self, [a, b], [out_type])
-
-    def infer_shape(self, node, in_shapes):
-        return [in_shapes[1]]
-
-    def perform(self, node, inputs, output_storage):
-        a, b = inputs
-        if a.shape[0] != a.shape[1] or a.shape[1] != b.shape[0]:
-            raise TypeError('%s: inputs have improper lengths' %
-                            self.__class__.__name__)
-        try:
-            output_storage[0][0] = scipy.linalg.solve_triangular(a, b,
-                            trans=0, lower=self.lower,
-                       unit_diagonal=self.unit_diagonal,
-                             overwrite_b=self.overwrite_b, debug=False)
-
-        except Exception, e:
-            e.args = e.args + ('array \'a\' might be singular',) 
-            raise 
-
-
-
-        #except:
-        #    raise  Exception('%s: array \'a\' is singular'
-        #                     % self.__class__.__name__)
-
-    def grad(self, inputs, cost_grad):
-        """
-        Notes:
-        1. The gradient is computed under the assumption that perturbations
-        of the input array respect triangularity, i.e. partial derivatives wrt
-        triangular region are zero.
-        2. In contrast with the usual mathematical presentation, in order to
-        apply theano's 'reshape' function wich implements row-order (i.e. C
-        order), the differential expressions below have been derived based on
-        the row-vectorizations of inputs 'a' and 'b'.
-
-        See The Matrix Reference Manual,
-        Copyright 1998-2011 Mike Brookes, Imperial College, London, UK
-        """
-
-        a, b = inputs
-        ingrad = cost_grad
-        ingrad = tensor.as_tensor_variable(ingrad)
-        shp_a = (tensor.shape(inputs[0])[1],
-                               tensor.shape(inputs[0])[1])
-        I_M = tensor.eye(*shp_a)
-        if self.lower:
-            inv_a = solve_triangular(a, I_M, lower=True)
-            tri_M = tril(tensor.ones(shp_a))
-        else:
-            inv_a = solve_triangular(a, I_M, lower=False)
-            tri_M = triu(tensor.ones(shp_a))
-        if b.ndim == 1:
-            prod_a_b = tensor.tensordot(-b.T, inv_a.T, axes=1)
-            prod_a_b = tensor.shape_padleft(prod_a_b)
-            jac_veca = kron(inv_a, prod_a_b)
-            jac_b = inv_a
-            outgrad_veca = tensor.tensordot(ingrad, jac_veca, axes=1)
-            outgrad_a = tensor.reshape(outgrad_veca,
-                        (inputs[0].shape[0], inputs[0].shape[0])) * tri_M
-            outgrad_b = tensor.tensordot(ingrad, jac_b, axes=1).flatten(ndim=1)
-        else:
-            ingrad_vec = ingrad.flatten(ndim=1)
-            prod_a_b = tensor.tensordot(-b.T, inv_a.T, axes=1)
-            jac_veca = kron(inv_a, prod_a_b)
-            I_N = tensor.eye(tensor.shape(inputs[1])[1],
-                               tensor.shape(inputs[1])[1])
-            jac_vecb = kron(inv_a, I_N)
-            outgrad_veca = tensor.tensordot(ingrad_vec, jac_veca, axes=1)
-            outgrad_a = tensor.reshape(outgrad_veca,
-                        (inputs[0].shape[0], inputs[0].shape[0])) * tri_M
-            outgrad_vecb = tensor.tensordot(ingrad_vec, jac_vecb, axes=1)
-            outgrad_b = tensor.reshape(outgrad_vecb,
-                        (inputs[1].shape[0], inputs[1].shape[1]))
-        return [outgrad_a, outgrad_b]
-
-
-def solve_triangular(a, b, lower=False, unit_diagonal=False,
-                             overwrite_b=False):
-    return SolveTriangular(lower=lower, unit_diagonal=unit_diagonal,
-                           overwrite_b=overwrite_b)(a, b)
+#      with solve() Op (still unwritten)
 
 
 class Eigvalsh(Op):
@@ -584,7 +215,7 @@ class Eigvalsh(Op):
             "Scipy not  available. Scipy is needed for the Eigvalsh op")
 
         if b == theano.tensor.NoneConst:
-            a = as_tensor_variable(a)  
+            a = as_tensor_variable(a)
             assert a.ndim == 2
 
             out_dtype = theano.scalar.upcast(a.dtype)
@@ -646,7 +277,7 @@ class EigvalshGrad(Op):
             "Scipy not available. Scipy is needed for the GEigvalsh op")
         a = as_tensor_variable(a)
         b = as_tensor_variable(b)
-        gw = as_tensor_variable(gw)  
+        gw = as_tensor_variable(gw)
         assert a.ndim == 2
         assert b.ndim == 2
         assert gw.ndim == 1
@@ -706,3 +337,61 @@ def kron(a, b):
                          o.shape[1] * o.shape[3]) +
                         tuple([o.shape[i] for i in range(4, o.ndim)]))
     return o
+
+
+class Expm(Op):
+    """Compute the matrix exponential of a square array
+    """
+
+    def make_node(self, A):
+        assert imported_scipy, (
+            "Scipy not available. Scipy is needed for the Expm op")
+
+        A = as_tensor_variable(A)
+        assert A.ndim == 2
+        expm = theano.tensor.matrix(dtype=A.dtype)
+        return Apply(self, [A,], [expm,])
+
+    def perform(self, node, (A,), (expm,)):
+        expm[0] = scipy.linalg.expm(A)
+
+    def grad(self, (A,), (g_out,)):
+        return [ExpmGrad()(A, g_out)]
+
+    def infer_shape(self, node, shapes):
+        return [shapes[0]]
+
+
+class ExpmGrad(Op):
+    """Gradient of the matrix exponential of a square array.
+    """
+
+    def make_node(self, A, gw):
+        assert imported_scipy, (
+            "Scipy not available. Scipy is needed for the Expm op")
+        A = as_tensor_variable(A)
+        assert A.ndim == 2
+        out = theano.tensor.matrix(dtype=A.dtype)
+        return Apply(self, [A, gw], [out,])
+
+    def infer_shape(self, node, shapes):
+        return [shapes[0]]
+
+    def perform(self, node, (A, gA), (out,)):
+        # Kalbfleisch and Lawless, J. Am. Stat. Assoc. 80 (1985) Equation 3.4
+        # Kind of... You need to do some algebra from there to arrive at
+        # this expression.
+        w, V = scipy.linalg.eig(A, right=True)
+        U = scipy.linalg.inv(V).T
+
+        exp_w = numpy.exp(w)
+        X = numpy.subtract.outer(exp_w, exp_w) / numpy.subtract.outer(w, w)
+        numpy.fill_diagonal(X, exp_w)
+        Y = U.dot(V.T.dot(gA).dot(U) * X).dot(V.T)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", numpy.ComplexWarning)
+            out[0] = Y.astype(A.dtype)
+
+
+expm = Expm()

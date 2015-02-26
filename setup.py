@@ -7,6 +7,7 @@
 import os
 import sys
 import subprocess
+import codecs
 from fnmatch import fnmatchcase
 from distutils.util import convert_path
 try:
@@ -54,8 +55,8 @@ MAINTAINER          = "LISA laboratory, University of Montreal"
 MAINTAINER_EMAIL    = "theano-dev@googlegroups.com"
 DESCRIPTION         = ('Optimizing compiler for evaluating mathematical ' +
                        'expressions on CPUs and GPUs.')
-LONG_DESCRIPTION    = (open("DESCRIPTION.txt").read() + "\n\n" +
-                       open("NEWS.txt").read())
+LONG_DESCRIPTION    = (codecs.open("DESCRIPTION.txt",encoding='utf-8').read() + "\n\n" +
+                       codecs.open("NEWS.txt",encoding='utf-8').read())
 URL                 = "http://deeplearning.net/software/theano/"
 DOWNLOAD_URL        = ""
 LICENSE             = 'BSD'
@@ -122,29 +123,13 @@ def git_version():
         git_revision = "unknown-git"
     return git_revision
 
-# Python 2.4 compatibility: Python versions 2.6 and later support new
-# exception syntax, but for now we have to resort to exec.
-if sys.hexversion >= 0x2070000:
-    exec("""\
+
 def write_text(filename, text):
-    with open(filename, 'w') as a:
-        try:
-            a.write(text)
-        except Exception as e:
-            print(e)
-""")
-else:
-    exec("""\
-def write_text(filename, text):
-    a = open(filename, 'w')
     try:
-        try:
+        with open(filename, 'w') as a:
             a.write(text)
-        except Exception, e:
-            print e
-    finally:
-        a.close()
-""")
+    except Exception as e:
+        print(e)
 
 
 def write_version_py(filename=os.path.join('theano', 'generated_version.py')):

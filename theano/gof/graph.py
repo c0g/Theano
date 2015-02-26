@@ -10,6 +10,8 @@ __docformat__ = "restructuredtext en"
 
 
 from copy import copy
+from itertools import count
+
 
 import theano
 import warnings
@@ -21,6 +23,7 @@ from theano.misc.ordered_set import OrderedSet
 is_same_graph_with_merge = None
 equal_computations = None
 
+NoContext = object()
 
 class Node(utils.object2):
     """A Node in a theano graph.
@@ -31,7 +34,6 @@ class Node(utils.object2):
     Variable.owner / Apply.inputs and its children
     via Variable.clients / Apply.outputs.
     """
-
     def get_parents(self):
         """ Return a list of the parents of this node.
         Should return a copy--i.e., modifying the return
@@ -115,6 +117,13 @@ class Apply(Node):
             else:
                 raise TypeError("The 'outputs' argument to Apply must contain Variable instances with no owner, not %s" % output)
 
+    def run_context(self):
+        """Returns the context for the node, or NoContext if no context is set.
+        """
+        if hasattr(self.op, 'get_context'):
+            return self.op.get_context(self)
+        return NoContext
+
     def default_output(self):
         """Returns the default output for this node.
 
@@ -135,9 +144,14 @@ class Apply(Node):
             if len(self.outputs) == 1:
                 return self.outputs[0]
             else:
-                raise AttributeError("%s.default_output should be an output index." % self.op)
+                raise AttributeError(
+                    "%s.default_output should be an output index." % self.op)
+        elif not isinstance(do, (int, long)):
+            raise AttributeError("%s.default_output should be an int or long" %
+                                 self.op)
         elif do < 0 or do >= len(self.outputs):
-            raise AttributeError("%s.default_output is out of range." % self.op)
+            raise AttributeError("%s.default_output is out of range." %
+                                 self.op)
         return self.outputs[do]
 
     def env_getter(self):
@@ -179,7 +193,8 @@ class Apply(Node):
         :note:
             tags are copied from self to the returned instance.
         """
-        cp = self.__class__(self.op, self.inputs, [output.clone() for output in self.outputs])
+        cp = self.__class__(self.op, self.inputs,
+                            [output.clone() for output in self.outputs])
         cp.tag = copy(self.tag)
         return cp
 
@@ -230,6 +245,8 @@ class Apply(Node):
 
     nout = property(lambda self: len(self.outputs), doc='same as len(self.outputs)')
     """property: Number of outputs"""
+
+    context_type = property(lambda self: self.op.context_type, doc='type to use for the context')
 
 
 class Variable(Node):
@@ -308,9 +325,10 @@ class Variable(Node):
 
     `compile.function` uses each `Apply` instance's `inputs` attribute
     together with each Variable's `owner` field to determine which inputs are necessary to compute the function's outputs.
-
     """
     #__slots__ = ['type', 'owner', 'index', 'name']
+    __count__ = count(0)
+
     def __init__(self, type, owner=None, index=None, name=None):
         """Initialize type, owner, index, name.
 
@@ -328,6 +346,8 @@ class Variable(Node):
         :param name: a string for pretty-printing and debugging
 
         """
+        super(Variable, self).__init__()
+
         self.tag = utils.scratchpad()
         self.type = type
         if owner is not None and not isinstance(owner, Apply):
@@ -339,6 +359,7 @@ class Variable(Node):
         if name is not None and not isinstance(name, basestring):
             raise TypeError("name must be a string", name)
         self.name = name
+        self.auto_name = 'auto_' + str(next(self.__count__))
 
     def __str__(self):
         """WRITEME"""
@@ -783,7 +804,7 @@ def io_toposort(inputs, outputs, orderings=None):
     """WRITEME
 
     inputs: a list or tuple of Variable instances
-    outputs: a list or tuple of Variable instances
+    outputs: a list or tuple of Apply instances
 
     orderings: a dictionary
                 key: Apply instance
@@ -873,6 +894,7 @@ def is_same_graph(var1, var2, givens=None, debug=False):
     # Get result from the merge-based function.
     rval1 = is_same_graph_with_merge(var1=var1, var2=var2, givens=givens)
     # Get result from the function `equal_computations` from scan_utils.
+
     use_equal_computations = True
     if givens:
         # We need to build the `in_xs` and `in_ys` lists. To do this, we need

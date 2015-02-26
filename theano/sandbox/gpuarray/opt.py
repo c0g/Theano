@@ -20,7 +20,8 @@ from theano.gof.python25 import all, any
 from theano.tensor.nnet.conv import ConvOp
 from theano.sandbox.gpuarray.type import GpuArrayType
 from theano.sandbox.gpuarray.basic_ops import (
-    host_from_gpu, gpu_from_host, HostFromGpu, GpuSplit,
+    host_from_gpu, gpu_from_host, HostFromGpu, GpuFromHost,
+    GpuSplit,
     gpu_alloc, GpuAlloc, GpuReshape, GpuEye, gpu_join, GpuJoin,
 )
 from theano.sandbox.gpuarray.blas import gpu_dot22, GpuGemv, GpuGemm, GpuGer
@@ -78,13 +79,17 @@ def safe_to_cpu(x):
         return x
 
 
-def op_lifter(OP):
+def op_lifter(OP, cuda_only=False):
     """
     OP(..., host_from_gpu(), ...) -> host_from_gpu(GpuOP(...))
     gpu_from_host(OP(inp0, ...)) -> GpuOP(inp0, ...)
     """
     def f(maker):
         def local_opt(node):
+            dev = theano.sandbox.gpuarray.init_dev.device
+            if cuda_only and not dev.startswith('cuda'):
+                return
+
             if type(node.op) in OP:
 
                 # Either one of our inputs is on the gpu or
@@ -338,6 +343,21 @@ def local_gpua_split(node):
 @register_opt('fast_compile')
 @op_lifter([tensor.Subtensor])
 def local_gpua_subtensor(node):
+    x = node.inputs[0]
+    if (x.owner and isinstance(x.owner.op, HostFromGpu)):
+        gpu_x = x.owner.inputs[0]
+        if (gpu_x.owner and
+            isinstance(gpu_x.owner.op, GpuFromHost) and
+            # And it is a shared var or an input of the graph.
+            not gpu_x.owner.inputs[0].owner):
+            if len(x.clients) == 1:
+                if any([n == 'output' or any([isinstance(v.type, GpuArrayType)
+                                              for v in n.inputs + n.outputs])
+                        for n,_  in node.outputs[0].clients]):
+                    return
+                else:
+                    return [host_from_gpu(gpu_from_host(node.outputs[0]))]
+
     return GpuSubtensor(node.op.idx_list)
 
 
@@ -484,25 +504,25 @@ def local_gpua_eye(node):
 
 
 @register_opt('fast_compile')
-@op_lifter([tensor.nnet.CrossentropySoftmaxArgmax1HotWithBias])
+@op_lifter([tensor.nnet.CrossentropySoftmaxArgmax1HotWithBias], cuda_only=True)
 def local_gpua_crossentropysoftmaxargmax1hotwithbias(node):
     return GpuCrossentropySoftmaxArgmax1HotWithBias()
 
 
 @register_opt('fast_compile')
-@op_lifter([tensor.nnet.CrossentropySoftmax1HotWithBiasDx])
+@op_lifter([tensor.nnet.CrossentropySoftmax1HotWithBiasDx], cuda_only=True)
 def local_gpua_crossentropysoftmax1hotwithbiasdx(node):
     return GpuCrossentropySoftmax1HotWithBiasDx()
 
 
 @register_opt('fast_compile')
-@op_lifter([tensor.nnet.Softmax])
+@op_lifter([tensor.nnet.Softmax], cuda_only=True)
 def local_gpua_softmax(node):
     return GpuSoftmax()
 
 
 @register_opt('fast_compile')
-@op_lifter([tensor.nnet.SoftmaxWithBias])
+@op_lifter([tensor.nnet.SoftmaxWithBias], cuda_only=True)
 def local_gpua_softmaxwithbias(node):
     return GpuSoftmaxWithBias()
 
@@ -510,7 +530,8 @@ def local_gpua_softmaxwithbias(node):
 @register_opt('fast_compile')
 @op_lifter([theano.tensor.opt.Assert])
 def local_assert(node):
-    return [host_from_gpu(node.op(node.inputs[0].owner.inputs[0]))]
+    return [host_from_gpu(node.op(node.inputs[0].owner.inputs[0],
+                                  *node.inputs[1:]))]
 
 
 @register_opt('fast_compile')
@@ -695,13 +716,11 @@ def local_scan_to_gpua(node):
     _cmodule_key = gof.CLinker().cmodule_key_(local_fgraph, [])
     info['gpu_hash'] = hash(_cmodule_key)
 
-    nw_op = scan_op.Scan(scan_ins, scan_outs, info,
-                         typeConstructor=GpuArrayType).make_node(*nw_ins)
+    nw_op = scan_op.Scan(scan_ins, scan_outs, info).make_node(*nw_ins)
     return nw_op.outputs
 
 optdb.register('gpua_scanOp_make_inplace',
-               scan_opt.ScanInplaceOptimizer(typeConstructor=GpuArrayType,
-                                             gpua_flag=True),
+               scan_opt.ScanInplaceOptimizer(gpua_flag=True),
                75,
                'gpua',
                'fast_run',

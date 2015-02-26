@@ -14,19 +14,17 @@ import theano
 from theano import gof
 from theano.compat import get_unbound_function
 from theano.compat.six import StringIO
-from theano.gof import FunctionGraph,graph, utils, link, ops_with_inner_function
+from theano.gof import (FunctionGraph, graph, utils, link,
+                        ops_with_inner_function)
 from theano.gof.link import raise_with_op
 from theano.gof.cc import CLinker
 from theano.gof.python25 import all, any, product as itertools_product
 from theano.configparser import (config, AddConfigVar, BoolParam, IntParam,
-        StrParam)
-from theano.compile.function_module import (FunctionMaker,
-        Function,
-        infer_reuse_pattern,
-        SymbolicInputKit,
-        SymbolicOutput,
-        Supervisor,
-        std_fgraph)
+                                 StrParam)
+from theano.compile.function_module import (
+    FunctionMaker, Function, infer_reuse_pattern,
+    SymbolicInputKit, SymbolicOutput, Supervisor, std_fgraph
+    )
 from theano.compile.mode import Mode, register_mode
 from theano.compile.ops import OutputGuard
 
@@ -494,7 +492,8 @@ def char_from_number(number):
 def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
                file=sys.stdout, print_destroy_map=False,
                print_view_map=False, order=None, ids='CHAR',
-               stop_on_name=False, prefix_child=None):
+               stop_on_name=False, prefix_child=None,
+               scan_ops=None, profile=None):
     """Print the graph leading to `r` to given depth.
 
     :param r: Variable instance
@@ -502,10 +501,10 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
     :param depth: maximum recursion depth (Default -1 for unlimited).
     :param done: dict of Apply instances that have already been printed
                  and their associated printed ids
-    :param print_type: wether to print the Variable type after the other infos
+    :param print_type: whether to print the Variable type after the other infos
     :param file: file-like object to which to print
-    :param print_destroy_map: wether to print the op destroy_map after ofther info
-    :param print_view_map: wether to print the op view_map after ofther info
+    :param print_destroy_map: whether to print the op destroy_map after other info
+    :param print_view_map: whether to print the op view_map after other info
     :param order: If not empty will print the index in the toposort.
     :param ids: How do we print the identifier of the variable
                 id - print the python id value
@@ -514,6 +513,8 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
                 "" - don't print an identifier
     :param stop_on_name: When True, if a node in the graph has a name,
                          we don't print anything below it.
+    :param scan_ops: Scan ops in the graph will be added inside this list
+                     for later printing purposes.
 
     """
     if depth == 0:
@@ -524,6 +525,9 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
 
     if done is None:
         done = dict()
+
+    if scan_ops is None:
+        scan_ops = []
 
     if print_type:
         type_str = ' <%s>' % r.type
@@ -575,37 +579,79 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
         o = ''
         if order:
             o = str(order.index(r.owner))
+
         already_printed = a in done  # get_id_str put it in the dict
         id_str = get_id_str(a)
 
-        if len(a.outputs) == 1:
-            print >> file, '%s%s %s%s \'%s\' %s %s %s' % (prefix, a.op,
-                                                             id_str,
-                                                             type_str, r_name,
-                                                             destroy_map_str,
-                                                             view_map_str,
-                                                             o)
+        if profile == None or a not in profile.apply_time:
+            if len(a.outputs) == 1:
+                print >> file, '%s%s %s%s \'%s\' %s %s %s' % (prefix, a.op,
+                                                              id_str,
+                                                              type_str,
+                                                              r_name,
+                                                              destroy_map_str,
+                                                              view_map_str,
+                                                              o)
+            else:
+                print >> file, '%s%s.%i %s%s \'%s\' %s %s %s' % (prefix, a.op,
+                                                                 a.outputs.index(r),
+                                                                 id_str, type_str,
+                                                                 r_name,
+                                                                 destroy_map_str,
+                                                                 view_map_str,
+                                                                 o)
         else:
-            print >> file, '%s%s.%i %s%s \'%s\' %s %s %s' % (prefix, a.op,
-                                                            a.outputs.index(r),
-                                                            id_str, type_str,
-                                                            r_name,
-                                                            destroy_map_str,
-                                                            view_map_str,
-                                                            o)
+            op_time = profile.apply_time[a]
+            op_time_percent = (op_time / profile.fct_call_time) * 100
+            tot_time_dict = profile.compute_total_times()
+            tot_time = tot_time_dict[a]
+            tot_time_percent = (tot_time_dict[a] / profile.fct_call_time) * 100
+     
+            if len(a.outputs) == 1:
+                print >> file, '%s%s %s%s \'%s\' %s %s %s --> %8.2es %4.1f%% %8.2es %4.1f%%'\
+                    % (prefix, a.op,
+                       id_str,
+                       type_str,
+                       r_name,
+                       destroy_map_str,
+                       view_map_str,
+                       o, op_time,
+                       op_time_percent,
+                       tot_time,
+                       tot_time_percent)
+            else:
+                print >> file, '%s%s.%i %s%s \'%s\' %s %s %s --> %8.2es %4.1f%% %8.2es %4.1f%%'\
+                    % (prefix, a.op,
+                       a.outputs.index(r),
+                       id_str, type_str,
+                       r_name,
+                       destroy_map_str,
+                       view_map_str,
+                       o, op_time,
+                       op_time_percent,
+                       tot_time,
+                       tot_time_percent)
+
         if not already_printed:
             if (not stop_on_name or
                 not (hasattr(r, 'name') and r.name is not None)):
                 new_prefix = prefix_child + ' |'
                 new_prefix_child = prefix_child + ' |'
+
                 for idx, i in enumerate(a.inputs):
                     if idx == len(a.inputs) - 1:
                         new_prefix_child = prefix_child + '  '
 
+                    if hasattr(i, 'owner') and hasattr(i.owner, 'op'):
+                        if isinstance(i.owner.op, theano.scan_module.scan_op.Scan):
+                            scan_ops.append(i)
+
                     debugprint(i, new_prefix, depth=depth - 1, done=done,
                                print_type=print_type, file=file, order=order,
                                ids=ids, stop_on_name=stop_on_name,
-                               prefix_child=new_prefix_child)
+                               prefix_child=new_prefix_child, scan_ops=scan_ops,
+                               profile=profile)
+
     else:
         #this is an input variable
         id_str = get_id_str(r)
@@ -624,7 +670,6 @@ def _optcheck_fgraph(input_specs, output_specs, accept_inplace=False):
     :type accept_inplace: Bool
     :rtype: `FunctionGraph`
     :returns: a new FunctionGraph with a cloned graph, with debugging `Feature` instances already installed.
-
     """
     orig_inputs = [spec.variable for spec in input_specs]
     updates = [spec.update for spec in input_specs if spec.update]
@@ -861,8 +906,12 @@ def _lessbroken_deepcopy(a):
     """
     # this exists because copy.deepcopy on numpy arrays is broken
     # This logic is also in link.py
+    from theano.gof.type import CDataType
     if type(a) in (numpy.ndarray, numpy.memmap):
         rval = a.copy()
+    elif type(a) is CDataType._cdata_type:
+        # This is not copyable (and should be used for constant data).
+        rval = a
     else:
         rval = copy.deepcopy(a)
 
@@ -1542,6 +1591,17 @@ default_make_thunk = [get_unbound_function(theano.gof.Op.make_thunk),
                       get_unbound_function(theano.gof.OpenMPOp.make_thunk)]
 
 
+# Debug mode cheats and initializes the linker in a different way in
+# its maker so we can cheat some more by having a linker to satisfy
+# the external requirements of the .linker attribute of a mode
+# 1) it's a class instance
+# 2) it a has a .clone() method
+class _DummyLinker(object):
+    # This is not a real linker anyway
+    def clone(self, allow_gc=None):
+        return self
+
+
 class _Linker(gof.link.LocalLinker):
     """Special debugging linker"""
     def __init__(self, maker, schedule=None):
@@ -1632,9 +1692,16 @@ class _Linker(gof.link.LocalLinker):
             if ((self.maker.mode.check_py_code or thunks_c[-1] is None) and
                 node.op.perform.func_code != gof.op.PureOp.perform.func_code):
                 p = node.op.perform
-                thunk = (lambda p=p, i=node_input_storage,
-                         o=node_output_storage,
-                         n=node: p(n, [x[0] for x in i], o))
+                ctx = node.run_context()
+                if ctx is graph.NoContext:
+                    thunk = (lambda p=p, i=node_input_storage,
+                             o=node_output_storage,
+                             n=node: p(n, [x[0] for x in i], o))
+                else:
+                    ctx_val = node.context_type.filter(ctx)
+                    thunk = (lambda p=p, i=node_input_storage,
+                             o=node_output_storage, ctx=ctx_val,
+                             n=node: p(n, [x[0] for x in i], o, ctx))
                 thunk.inputs = node_input_storage
                 thunk.outputs = node_output_storage
                 thunk.perform = p
@@ -2085,7 +2152,7 @@ class _Linker(gof.link.LocalLinker):
             return deco
 
         f = run_with_tensortype_filter_check(f)
-
+        f.storage_map = storage_map
         f.allow_gc = True
         assert len(fgraph.inputs) == len(input_storage)
         assert len(fgraph.outputs) == len(output_storage)
@@ -2152,7 +2219,7 @@ class _Maker(FunctionMaker):  # inheritance buys a few helper functions
         # Check if some input variables are unused
         self._check_unused_inputs(inputs, outputs, on_unused_input)
 
-        # Make a list of (SymbolicInput|SymblicInputKits, indices, [SymbolicInput,...]), one 
+        # Make a list of (SymbolicInput|SymblicInputKits, indices, [SymbolicInput,...]), one
         # tuple for each input. (See Function.indices for more details)
         indices = [[input] + self.expand_in(input, _inputs) for input in inputs]
 
@@ -2164,17 +2231,14 @@ class _Maker(FunctionMaker):  # inheritance buys a few helper functions
 
             # optimize the fgraph
             compute_test_value_orig = theano.config.compute_test_value
-            add_stack_trace_on_call = gof.Op.add_stack_trace_on_call
             try:
                 theano.config.compute_test_value = theano.config.compute_test_value_opt
-                gof.Op.add_stack_trace_on_call = False  # Should it be 0 == i?
                 optimizer(fgraph)
 
                 theano.compile.function_module.insert_deepcopy(fgraph, inputs,
                                                     outputs + additional_outputs)
             finally:
                 theano.config.compute_test_value = compute_test_value_orig
-                gof.Op.add_stack_trace_on_call = add_stack_trace_on_call
 
             if i:
                 li = fgraph.equivalence_tracker.event_list
@@ -2460,7 +2524,7 @@ class DebugMode(Mode):
             check_isfinite=None,
             check_preallocated_output=None,
             require_matching_strides=None,
-            linker=None):
+            linker=_DummyLinker()):
 
         """Initialize member variables.
 
@@ -2470,13 +2534,13 @@ class DebugMode(Mode):
         Mode.requiring() and some other fct to work with DebugMode too.
         """
 
-        if linker is not None and not issubclass(linker, _Linker):
+        if not isinstance(linker, _DummyLinker):
             raise Exception("DebugMode can only use its own linker! You "
                             "should not provide one.", linker)
 
         super(DebugMode, self).__init__(
                 optimizer=optimizer,
-                linker=_Linker)
+                linker=linker)
 
         if stability_patience is not None:
             self.stability_patience = stability_patience

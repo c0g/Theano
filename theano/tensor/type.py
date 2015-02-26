@@ -52,6 +52,18 @@ class TensorType(Type):
                 " AdvancedSubtensor1 sparse_grad. Now use"
                 " theano.sparse_grad(a_tensor[an_int_vector]).")
 
+    def clone(self, dtype=None, broadcastable=None):
+        """
+        Return a copy of the type optionally with a new dtype or
+        broadcastable pattern.
+        """
+        if dtype is None:
+            dtype = self.dtype
+        if broadcastable is None:
+            broadcastable = self.broadcastable
+        return self.__class__(dtype, broadcastable, name=self.name,
+                              sparse_grad=self.sparse_grad)
+
     def filter(self, data, strict=False, allow_downcast=None):
         """Convert `data` to something which can be associated to a
         `TensorVariable`.
@@ -247,6 +259,14 @@ class TensorType(Type):
         """Compare True iff other is the same kind of TensorType"""
         return type(self) == type(other) and other.dtype == self.dtype \
             and other.broadcastable == self.broadcastable
+
+    def convert_variable(self, var):
+        if (type(self) == type(var.type) and
+            self.dtype == var.type.dtype and
+            self.ndim == var.type.ndim and
+            all(sb == ob or ob for sb, ob in zip(self.broadcastable,
+                                                var.type.broadcastable))):
+            return theano.tensor.patternbroadcast(var, self.broadcastable)
 
     @staticmethod
     def may_share_memory(a, b):

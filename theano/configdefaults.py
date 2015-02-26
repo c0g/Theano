@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 
 import theano
@@ -118,6 +119,7 @@ AddConfigVar('print_active_device',
         BoolParam(True, allow_override=False),
         in_c_key=False)
 
+
 # Do not add FAST_RUN_NOGC to this list (nor any other ALL CAPS shortcut).
 # The way to get FAST_RUN_NOGC is with the flag 'linker=c|py_nogc'.
 # The old all capital letter way of working is deprecated as it is not
@@ -130,22 +132,40 @@ AddConfigVar('mode',
                 'FAST_COMPILE', 'PROFILE_MODE', 'DEBUG_MODE'),
         in_c_key=False)
 
-enum = EnumStr("g++", "")
+param = "g++"
 
 # Test whether or not g++ is present: disable C code if it is not.
 try:
     rc = call_subprocess_Popen(['g++', '-v'])
 except OSError:
-    enum = EnumStr("")
+    param = ""
     rc = 1
+
+# On Mac we test for 'clang++' and use it by default
+if sys.platform == 'darwin':
+    try:
+        rc = call_subprocess_Popen(['clang++', '-v'])
+        param = "clang++"
+    except OSError:
+        pass
+
+# Try to find the full compiler path from the name
+if param != "":
+    import distutils.spawn
+    newp = distutils.spawn.find_executable(param)
+    if newp is not None:
+        param = newp
+    del newp
+    del distutils
+
 AddConfigVar('cxx',
              "The C++ compiler to use. Currently only g++ is"
              " supported, but supporting additional compilers should not be "
              "too difficult. "
              "If it is empty, no C++ code is compiled.",
-             enum,
+             StrParam(param),
              in_c_key=False)
-del enum
+del param
 
 if rc == 0 and config.cxx != "":
     # Keep the default linker the same as the one for the mode FAST_RUN
@@ -275,7 +295,8 @@ AddConfigVar('traceback.limit',
              "The number of stack to trace. -1 mean all.",
 # We default to 6 to be able to know where v1 + v2 is created in the
 # user script. The bigger this number is, the more run time it takes.
-             IntParam(6),
+# We need to default to 7 to support theano.tensor.tensor(...).
+             IntParam(7),
              in_c_key=False)
 
 AddConfigVar('experimental.mrg',
@@ -442,6 +463,14 @@ AddConfigVar('warn.reduce_join',
              BoolParam(warn_default('0.7')),
              in_c_key=False)
 
+AddConfigVar('warn.inc_set_subtensor1',
+             ('Warn if previous versions of Theano (before 0.7) could have '
+              'given incorrect results for inc_subtensor and set_subtensor '
+              'when using some patterns of advanced indexing (indexing with '
+              'one vector or matrix of ints).'),
+             BoolParam(warn_default('0.7')),
+             in_c_key=False)
+
 AddConfigVar('compute_test_value',
         ("If 'True', Theano will run each op at graph build time, using "
          "Constants, SharedVariables and the tag 'test_value' as inputs "
@@ -464,6 +493,12 @@ AddConfigVar('unpickle_function',
               " them when it shouldn't"),
              BoolParam(True),
              in_c_key=False)
+
+AddConfigVar('reoptimize_unpickled_function',
+        "Re-optimize the graph when a theano function is unpickled from the disk.",
+        BoolParam(True, allow_override=True),
+        in_c_key=False)
+
 
 """Note to developers:
     Generally your exceptions should use an apply node's __str__
@@ -538,3 +573,11 @@ AddConfigVar('check_input',
               "(particularly for scalars) and reduce the number of generated C "
               "files.",
              BoolParam(True))
+
+AddConfigVar('cache_optimizations',
+             "WARNING: work in progress, does not work yet. "
+             "Specify if the optimization cache should be used. This cache will "
+             "any optimized graph and its optimization. Actually slow downs a lot "
+             "the first optimization, and could possibly still contains some bugs. "
+             "Use at your own risks.",
+             BoolParam(False))

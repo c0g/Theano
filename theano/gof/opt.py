@@ -22,8 +22,6 @@ import theano
 from theano import config
 from theano.gof.python25 import any, all, deque
 
-#if sys.version_info[:2] >= (2,5):
-#  from collections import defaultdict
 
 _logger = logging.getLogger('theano.gof.opt')
 
@@ -154,7 +152,7 @@ def inplace_optimizer(f):
 
 
 class SeqOptimizer(Optimizer, list):
-    #inherit from Optimizer first to get Optimizer.__hash__
+    # inherit from Optimizer first to get Optimizer.__hash__
     """WRITEME
     Takes a list of L{Optimizer} instances and applies them
     sequentially.
@@ -825,6 +823,98 @@ class LocalOptimizer(object):
                 (' ' * level), self.__class__.__name__, id(self))
 
 
+theano.configparser.AddConfigVar('metaopt.verbose',
+        "Enable verbose output for meta optimizers",
+        theano.configparser.BoolParam(False), in_c_key=False)
+
+class LocalMetaOptimizer(LocalOptimizer):
+    """Base class for meta-optimizers that try a set of LocalOptimizers
+    to replace a node and choose the one that executes the fastest"""
+
+    def __init__(self, tracks=None, optimizers=()):
+        self._tracks = tracks
+        self.optimizers = list(optimizers)
+        self.verbose = config.metaopt.verbose
+
+    def register(self, optimizer):
+        self.optimizers.append(optimizer)
+
+    def tracks(self):
+        return self._tracks
+
+    def transform(self, node):
+        # safety check: depending on registration, tracks may have been ignored
+        if self._tracks is not None:
+            if not isinstance(node.op, tuple(self._tracks)):
+                return
+        # first, we need to provide dummy values for all inputs
+        # to the node that are not shared variables anyway
+        givens = {}
+        missing = set()
+        for input in node.inputs:
+            if isinstance(input, theano.compile.SharedVariable):
+                pass
+            elif hasattr(input.tag, 'test_value'):
+                givens[input] = theano.shared(
+                    input.type.filter(input.tag.test_value),
+                    input.name,
+                    broadcastable=input.broadcastable,
+                    borrow=True)
+            else:
+                missing.add(input)
+        if missing:
+            givens.update(self.provide_inputs(node, missing))
+            missing.difference_update(givens.keys())
+        # ensure we have data for all input variables that need it
+        if missing:
+            if self.verbose:
+                print ("%s cannot meta-optimize %s, "
+                       "%d of %d input shapes unknown" %
+                       (self.__class__.__name__, node, len(missing), node.nin))
+            return
+        # now we can apply the different optimizations in turn,
+        # compile the resulting subgraphs and time their execution
+        if self.verbose:
+            print ("%s meta-optimizing %s (%d choices):" %
+                   (self.__class__.__name__, node, len(self.optimizers)))
+        timings = []
+        for opt in self.optimizers:
+            outputs = opt.transform(node)
+            if outputs:
+                try:
+                    fn = theano.function([], outputs, givens=givens)
+                    timing = min(self.time_call(fn) for _ in range(3))
+                except Exception as e:
+                    if self.verbose:
+                        print "* %s: exception" % opt, e
+                    continue
+                else:
+                    if self.verbose:
+                        print "* %s: %.5g sec" % (opt, timing)
+                    timings.append((timing, outputs, opt))
+            else:
+                if self.verbose:
+                    print "* %s: not applicable" % opt
+        # finally, we choose the fastest one
+        if timings:
+            timings.sort()
+            if self.verbose:
+                print "= %s" % timings[0][2]
+            return timings[0][1]
+        return
+
+    def provide_inputs(self, node, inputs):
+        """If implemented, returns a dictionary mapping all symbolic variables
+        in ``inputs`` to SharedVariable instances of suitable dummy values. The
+        ``node`` can be inspected to infer required input shapes."""
+        raise NotImplementedError()
+
+    def time_call(self, fn):
+        start = time.time()
+        fn()
+        return time.time() - start
+
+
 class FromFunctionLocalOptimizer(LocalOptimizer):
     """WRITEME"""
     def __init__(self, fn, tracks=None, requirements=()):
@@ -874,6 +964,9 @@ class LocalOptGroup(LocalOptimizer):
     """WRITEME"""
 
     def __init__(self, *optimizers):
+        if len(optimizers) == 1 and isinstance(optimizers[0], list):
+            # This happen when created by LocalGroupDB.
+            optimizers = tuple(optimizers[0])
         self.opts = optimizers
         self.reentrant = any(getattr(opt, 'reentrant', True)
                              for opt in optimizers)
@@ -882,8 +975,16 @@ class LocalOptGroup(LocalOptimizer):
 
     def __str__(self):
         return getattr(self, '__name__',
-                       ('<theano.gof.opt.LocalOptGroup instance>' +
-                        str([str(o) for o in self.opts])))
+                       ('LocalOptGroup(%s)' %
+                        ','.join([str(o) for o in self.opts])))
+
+    def tracks(self):
+        t = []
+        for l in self.opts:
+            tt = l.tracks()
+            if tt:
+                t.extend(tt)
+        return t
 
     def transform(self, node):
         for opt in self.opts:
@@ -1241,6 +1342,30 @@ class PatternSub(LocalOptimizer):
 
 # Use the following classes to apply LocalOptimizers
 
+class Updater:
+    def __init__(self, importer, pruner, chin):
+        self.importer = importer
+        self.pruner = pruner
+        self.chin = chin
+
+    def on_import(self, fgraph, node, reason):
+        if self.importer:
+            self.importer(node)
+
+    def on_prune(self, fgraph, node, reason):
+        if self.pruner:
+            self.pruner(node)
+
+    def on_change_input(self, fgraph, node, i, r, new_r, reason):
+        if self.chin:
+            self.chin(node, i, r, new_r, reason)
+
+    def on_detach(self, fgraph):
+        # To allow pickling this object
+        self.importer = None
+        self.pruner = None
+        self.chin = None
+
 
 class NavigatorOptimizer(Optimizer):
     """Abstract class
@@ -1329,18 +1454,7 @@ class NavigatorOptimizer(Optimizer):
         if importer is None and pruner is None:
             return None
 
-        class Updater:
-            if importer is not None:
-                def on_import(self, fgraph, node, reason):
-                    importer(node)
-            if pruner is not None:
-                def on_prune(self, fgraph, node, reason):
-                    pruner(node)
-            if chin is not None:
-                def on_change_input(self, fgraph, node, i, r, new_r, reason):
-                    chin(node, i, r, new_r, reason)
-
-        u = Updater()
+        u = Updater(importer, pruner, chin)
         fgraph.attach_feature(u)
         return u
 
@@ -1562,8 +1676,10 @@ class OpKeyOptimizer(NavigatorOptimizer):
 class ChangeTracker:
     def __init__(self):
         self.changed = False
+        self.nb_imported = 0
 
     def on_import(self, fgraph, node, reason):
+        self.nb_imported += 1
         self.changed = True
 
     def on_change_input(self, fgraph, node, i, r, new_r, reason):
@@ -1628,13 +1744,14 @@ class EquilibriumOptimizer(NavigatorOptimizer):
 
     def add_requirements(self, fgraph):
         super(EquilibriumOptimizer, self).add_requirements(fgraph)
-        fgraph.attach_feature(ChangeTracker())
         for opt in self.get_local_optimizers():
             opt.add_requirements(fgraph)
         for opt in self.global_optimizers:
             opt.add_requirements(fgraph)
 
     def apply(self, fgraph, start_from=None):
+        change_tracker = ChangeTracker()
+        fgraph.attach_feature(change_tracker)
         if start_from is None:
             start_from = fgraph.outputs
         else:
@@ -1655,9 +1772,11 @@ class EquilibriumOptimizer(NavigatorOptimizer):
         time_opts = {}
         io_toposort_timing = []
         nb_nodes = []
+        node_created = {}
         for opt in self.global_optimizers + list(self.get_local_optimizers()):
             global_process_count.setdefault(opt, 0)
             time_opts.setdefault(opt, 0)
+            node_created.setdefault(opt, 0)
 
         while changed and not max_use_abort:
             process_count = {}
@@ -1666,15 +1785,17 @@ class EquilibriumOptimizer(NavigatorOptimizer):
 
             #apply global optimizers
             for gopt in self.global_optimizers:
-                fgraph.change_tracker.reset()
+                change_tracker.reset()
+                nb = change_tracker.nb_imported
                 t_opt = time.time()
                 gopt.apply(fgraph)
                 time_opts[gopt] += time.time() - t_opt
-                if fgraph.change_tracker.changed:
+                if change_tracker.changed:
                     process_count.setdefault(gopt, 0)
                     process_count[gopt] += 1
                     global_process_count[gopt] += 1
                     changed = True
+                    node_created[gopt] += change_tracker.nb_imported - nb
                     if global_process_count[gopt] > max_use:
                         max_use_abort = True
                         opt_name = (getattr(gopt, "name", None)
@@ -1711,6 +1832,7 @@ class EquilibriumOptimizer(NavigatorOptimizer):
                     for lopt in (self.local_optimizers_all +
                                  self.local_optimizers_map.get(type(node.op), []) +
                                  self.local_optimizers_map.get(node.op, [])):
+                        nb = change_tracker.nb_imported
                         t_opt = time.time()
                         lopt_change = self.process_node(fgraph, node, lopt)
                         time_opts[lopt] += time.time() - t_opt
@@ -1719,6 +1841,7 @@ class EquilibriumOptimizer(NavigatorOptimizer):
                             process_count[lopt] += 1
                             global_process_count[lopt] += 1
                             changed = True
+                            node_created[lopt] += change_tracker.nb_imported - nb
                             if global_process_count[lopt] > max_use:
                                 max_use_abort = True
                                 opt_name = (getattr(lopt, "name", None)
@@ -1739,10 +1862,11 @@ class EquilibriumOptimizer(NavigatorOptimizer):
                           + ". You can safely raise the current threshold of "
                           + "%f with the theano flag 'optdb.max_use_ratio'." %
                           config.optdb.max_use_ratio)
-
+        fgraph.remove_feature(change_tracker)
         return (self, loop_timing, loop_process_count,
                 (start_nb_nodes, end_nb_nodes, max_nb_nodes),
-                global_opt_timing, nb_nodes, time_opts, io_toposort_timing)
+                global_opt_timing, nb_nodes, time_opts, io_toposort_timing,
+                node_created)
 
     def print_summary(self, stream=sys.stdout, level=0, depth=-1):
         name = getattr(self, 'name', None)
@@ -1757,7 +1881,8 @@ class EquilibriumOptimizer(NavigatorOptimizer):
     def print_profile(stream, prof, level=0):
         (opt, loop_timing, loop_process_count,
          (start_nb_nodes, end_nb_nodes, max_nb_nodes),
-         global_opt_timing, nb_nodes, time_opts, io_toposort_timing) = prof
+         global_opt_timing, nb_nodes, time_opts, io_toposort_timing,
+         node_created) = prof
 
         blanc = ('    ' * level)
         print >> stream, blanc, "EquilibriumOptimizer",
@@ -1801,18 +1926,19 @@ class EquilibriumOptimizer(NavigatorOptimizer):
                 process_count[o] += v
         for opt, count in process_count.iteritems():
             if count > 0:
-                count_opt.append((time_opts[opt], count, opt))
+                count_opt.append((time_opts[opt], count,
+                                  node_created[opt], opt))
             else:
                 not_used.append((time_opts[opt], opt))
                 not_used_time += time_opts[opt]
 
         if count_opt:
             print >> stream, blanc, \
-                    '  times - times applied - name:'
+                    '  times - times applied - nb node created - name:'
             count_opt.sort()
-            for (t, count, opt) in count_opt[::-1]:
-                print >> stream, blanc, '  %.3fs - %d - %s' % (
-                    t, count, opt)
+            for (t, count, n_created, opt) in count_opt[::-1]:
+                print >> stream, blanc, '  %.3fs - %d - %d - %s' % (
+                    t, count, n_created, opt)
             print >> stream, blanc, '  %.3fs - in %d optimization that where not used (display only those with a runtime > 0)' % (
                 not_used_time, len(not_used))
             not_used.sort()

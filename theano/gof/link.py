@@ -1,13 +1,17 @@
 """WRITEME"""
 from copy import copy, deepcopy
+from sys import getsizeof
 import StringIO
 import sys
 import traceback
+import numpy
 
 import theano
 from theano.gof import utils
 from theano.gof import graph
 from theano.gof.type import Type
+
+from .utils import MethodNotDefined, undef
 
 __excepthook = sys.excepthook
 
@@ -56,7 +60,7 @@ sys.excepthook = thunk_hook
 
 
 # TODO: Make this work with linker defined schedule
-def raise_with_op(node, thunk=None, exc_info=None):
+def raise_with_op(node, thunk=None, exc_info=None, storage_map=None):
     """
     Re-raise an exception while annotating the exception object with
     debug info.
@@ -69,6 +73,9 @@ def raise_with_op(node, thunk=None, exc_info=None):
         A tuple containing the exception type, exception object and
         associated traceback, as would be returned by a call to
         `sys.exc_info()` (which is done if `None` is passed).
+    storage_map: dict, optional
+        storage map of the theano function that resulted in the
+        raised exception.
 
     Notes
     -----
@@ -94,7 +101,7 @@ def raise_with_op(node, thunk=None, exc_info=None):
         # print a simple traceback from KeyboardInterrupt
         raise exc_type, exc_value, exc_trace
     try:
-        trace = node.tag.trace
+        trace = node.outputs[0].tag.trace
     except AttributeError:
         try:
             trace = node.op.tag.trace
@@ -106,11 +113,6 @@ def raise_with_op(node, thunk=None, exc_info=None):
         exc_value.__applynode_index__ = node.fgraph.toposort().index(node)
     else:
         exc_value.__applynode_index__ = None
-
-    # nose and unittest catch the exception and do not run th thunk_hook
-    # so it can be useful to just blurt out errors right here
-    if raise_with_op.print_thunk_trace:
-        log_thunk_trace(exc_value)
 
     hints = []
     detailed_err_msg = "\nApply node that caused the error: " + str(node)
@@ -126,10 +128,10 @@ def raise_with_op(node, thunk=None, exc_info=None):
                        for ipt in thunk.inputs]
             scalar_values = []
             for ipt in thunk.inputs:
-                if getattr(ipt[0], "size", -1) == 1:
+                if getattr(ipt[0], "size", -1) <= 5:
                     scalar_values.append(ipt[0])
                 else:
-                    scalar_values.append("not scalar")
+                    scalar_values.append("not shown")
         else:
             shapes = "The thunk don't have an inputs attributes."
             strides = "So we can't access the strides of inputs values"
@@ -137,14 +139,14 @@ def raise_with_op(node, thunk=None, exc_info=None):
 
         detailed_err_msg += ("Inputs shapes: %s" % shapes +
                              "\nInputs strides: %s" % strides +
-                             "\nInputs scalar values: %s\n" % scalar_values)
+                             "\nInputs values: %s\n" % scalar_values)
     else:
         hints.append(
             "HINT: Use another linker then the c linker to"
             " have the inputs shapes and strides printed.")
 
     # Print node backtrace
-    tr = getattr(node.tag, 'trace', None)
+    tr = getattr(node.outputs[0].tag, 'trace', None)
     if tr:
         sio = StringIO.StringIO()
         traceback.print_list(tr, sio)
@@ -154,31 +156,64 @@ def raise_with_op(node, thunk=None, exc_info=None):
     else:
         hints.append(
             "HINT: Re-running with most Theano optimization disabled could"
-            " give you a back-traces when this node was created. This can"
-            " be done with by setting the Theano flags"
-            " optimizer=fast_compile")
+            " give you a back-trace of when this node was created. This can"
+            " be done with by setting the Theano flag"
+            " 'optimizer=fast_compile'. If that does not work,"
+            " Theano optimizations can be disabled with 'optimizer=None'.")
 
     if theano.config.exception_verbosity == 'high':
+
         f = StringIO.StringIO()
         theano.printing.debugprint(node, file=f, stop_on_name=True,
                                    print_type=True)
         detailed_err_msg += "\nDebugprint of the apply node: \n"
         detailed_err_msg += f.getvalue()
 
+        # Prints output_map
+        if storage_map is not None:
+            detailed_err_msg += "\nStorage map footprint:\n"
+            for k in storage_map.keys():
+                if storage_map[k][0] is not None:
+                    detailed_err_msg += " - " + str(k) + ", "
+                    shapeinfo = None
+                    if hasattr(storage_map[k][0], 'shape'):
+                        shapeinfo = storage_map[k][0].shape
+                        if len(shapeinfo) != 0:
+                            detailed_err_msg += "Shape: %s, " % str(shapeinfo)
+                        else:
+                            detailed_err_msg += "Shape: (1,), "
+                    if hasattr(storage_map[k][0], 'dtype'):
+                        dtype = storage_map[k][0].dtype
+                        detailed_err_msg += "ElemSize: %s Byte(s)" % numpy.dtype(dtype).itemsize
+                        if shapeinfo is None:
+                            detailed_err_msg += "\n"
+                        else:
+                            detailed_err_msg += ", TotalSize: %s Byte(s)\n" % (numpy.dtype(dtype).itemsize * numpy.prod(shapeinfo))
+                    else:
+                        bytes = getsizeof(storage_map[k][0])
+                        detailed_err_msg += "ElemSize: %s Byte(s)\n" % str(bytes)
+
+
     else:
         hints.append(
             "HINT: Use the Theano flag 'exception_verbosity=high'"
-            " for a debugprint of this apply node.")
+            " for a debugprint and storage map footprint of this apply node.")
+
+
 
     exc_value = exc_type(str(exc_value) + detailed_err_msg +
                          '\n' + '\n'.join(hints))
     raise exc_type, exc_value, exc_trace
 
-raise_with_op.print_thunk_trace = False
-
 
 class Linker(object):
     """WRITEME"""
+
+    def clone(self, allow_gc=undef):
+        new = copy(self)
+        if allow_gc is not undef:
+            new.allow_gc = allow_gc
+        return new
 
     def make_thunk(self):
         """
@@ -276,7 +311,8 @@ class Container(object):
         else:
             self.type = r.type
         if name is None:
-            self.name = r.name
+            # Some Type do not have a name field.
+            self.name = getattr(r, 'name', None)
         else:
             self.name = name
 
@@ -616,6 +652,7 @@ class PerformLinker(LocalLinker):
 
         f.allow_gc = self.allow_gc #HACK: this is a way of passing an arg to Function.__call__
         add_clear_storage(f, computed, storage_map)
+        f.storage_map = storage_map
 
         return f, [Container(input, storage) for input, storage in zip(fgraph.inputs, input_storage)], \
             [Container(output, storage, True) for output, storage in zip(fgraph.outputs, output_storage)], \
@@ -686,6 +723,11 @@ class WrapLinker(Linker):
             linkers=[copy(l) for l in self.linkers],
             wrapper=self.wrapper)
         return other
+
+    def clone(self, allow_gc=undef):
+        return self.__class__(
+            linkers=[l.clone(allow_gc=allow_gc) for l in self.linkers],
+            wrapper=self.wrapper)
 
     def accept(self, fgraph, no_recycling=None):
         """
@@ -758,7 +800,7 @@ class WrapLinker(Linker):
                 try:
                     wrapper(i, node, *thunks)
                 except Exception:
-                    raise_with_op(node, thunk)
+                    raise_with_op(node, *thunks)
         f.thunk_groups = thunk_groups
 
         return f, inputs0, outputs0

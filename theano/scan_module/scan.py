@@ -74,7 +74,8 @@ def scan(fn,
          go_backwards=False,
          mode=None,
          name=None,
-         profile=False):
+         profile=False,
+         allow_gc=None):
     """
     This function constructs and applies a Scan op to the provided
     arguments.
@@ -308,6 +309,10 @@ def scan(fn,
         Profile object collect (and print) information only when running the
         inner graph with the new cvm linker ( with default modes,
         other linkers this argument is useless)
+
+    :param allow_gc:
+        Set the value of allow gc for the internal graph of scan.  If
+        set to None, this will use the value of config.scan.allow_gc.
 
     :rtype: tuple
     :return: tuple of the form (outputs, updates); ``outputs`` is either a
@@ -589,7 +594,9 @@ def scan(fn,
         if init_out.get('taps', None) == [-1]:
 
             actual_arg = init_out['initial']
-            arg = safe_new(init_out['initial'])
+            if not isinstance(actual_arg, tensor.Variable):
+                actual_arg = tensor.as_tensor_variable(actual_arg)
+            arg = safe_new(actual_arg)
             if isinstance(arg, tensor.Constant):
                 # safe new returns a clone of the constants, but that is not
                 # what we need for initial states
@@ -962,6 +969,8 @@ def scan(fn,
     ##
 
     tap_array = mit_sot_tap_array + [[-1] for x in xrange(n_sit_sot)]
+    if allow_gc is None:
+        allow_gc = config.scan.allow_gc
     info = OrderedDict()
 
     info['tap_array'] = tap_array
@@ -980,6 +989,7 @@ def scan(fn,
     info['gpu'] = False
     info['as_while'] = as_while
     info['profile'] = profile
+    info['allow_gc'] = allow_gc
 
     local_op = scan_op.Scan(inner_inputs, new_outs, info)
 

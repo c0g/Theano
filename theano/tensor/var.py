@@ -16,6 +16,12 @@ from theano.tensor.type import TensorType
 from theano.configparser import config
 
 
+def equal_slices(s1, s2):
+    return (s1.start == s2.start and
+            s1.stop == s2.stop and
+            s1.step == s2.step)
+
+
 class AsTensorError(TypeError):
     """Raised when as_tensor_variable isn't able to create a
     TensorVariable.
@@ -363,7 +369,7 @@ class _tensor_py_operators:
         axis = None
         for i, arg in enumerate(args):
             try:
-                if arg != numpy.newaxis:
+                if arg is not numpy.newaxis:
                     theano.tensor.subtensor.Subtensor.convert(arg)
             except theano.tensor.subtensor.AdvancedIndexingError:
                 if advanced:
@@ -375,15 +381,17 @@ class _tensor_py_operators:
 
         if advanced:
             if (axis is not None
-                and all(a == slice(None) for a in args[:axis])
-                and all(a == slice(None) for a in args[axis + 1:])
+                and all(isinstance(a, slice) and
+                        equal_slices(a, slice(None)) for a in args[:axis])
+                and all(isinstance(a, slice) and
+                        equal_slices(a, slice(None)) for a in args[axis + 1:])
                 and isinstance(args[axis], (
                     numpy.ndarray,
                     list,
                     TensorVariable,
                     TensorConstant,
                     theano.tensor.sharedvar.TensorSharedVariable))):
-                return self.take(arg, axis)
+                return self.take(args[axis], axis)
             else:
                 return theano.tensor.subtensor.advanced_subtensor(self, *args)
         else:
@@ -574,6 +582,21 @@ class _tensor_py_operators:
     def fill(self, value):
         """Fill inputted tensor with the assigned value"""
         return theano.tensor.basic.fill(self, value)
+
+    def choose(self, a, choices, out=None, mode='raise'):
+        """Construct an array from an index array and a set of arrays to choose from."""
+        return theano.tensor.basic.choose(self, a, choices, out=None,
+                                          mode='raise')
+
+    def squeeze(self):
+        """Remove broadcastable dimensions from
+        the shape of an array.
+
+        It returns the input array, but with the
+        broadcastable dimensions removed. This is
+        always `x` itself or a view into `x`.
+        """
+        return theano.tensor.extra_ops.squeeze(self)
 
 
 class TensorVariable(_tensor_py_operators, Variable):

@@ -58,7 +58,8 @@ def conv2d(input, filters, image_shape=None, filter_shape=None,
                  of shape: image_shape + filter_shape - 1
 
     :type subsample: tuple of len 2
-    :param subsample: factor by which to subsample the output
+    :param subsample: factor by which to subsample the output.
+                      Also called strides elsewhere.
 
     :type image_shape: None, tuple/list of len 4 of int or Constant variable
     :param image_shape: The shape of the input parameter.
@@ -279,6 +280,7 @@ class ConvOp(OpenMPOp):
                  kshp_logical_top_aligned=True,
                  verbose=0,
                  version=-1,
+                 direction_hint='forward',
                  openmp=None):
         """
         Initializes a ConvOp with given output_mode (full/valid). All other
@@ -347,6 +349,8 @@ class ConvOp(OpenMPOp):
         :type version: int or str
         :param version: passed to GpuConv, if version='no_fft', fft
             optimization will be desactivated at the op level.
+        :param direction_hint: 'forward', 'bprop weights' or 'bprop inputs'.
+            Passed to GpuConv, used by graph optimizers to aid algorithm choice
 
         The 3 following parameters are used internally when we generate
         the gradient when dx!=1 or dy!=1.
@@ -422,6 +426,7 @@ class ConvOp(OpenMPOp):
         self.dy = dy
         self.verbose = verbose
         self.version = version
+        self.direction_hint = direction_hint
 
         # a triple
         if imshp_logical is None:
@@ -564,6 +569,7 @@ class ConvOp(OpenMPOp):
 
     def __setstate__(self, d):
         super(ConvOp, self).__setstate__(d)
+        self.direction_hint = d.get("direction_hint", None)
         self._rehash()
 
     def _rehash(self):
@@ -887,6 +893,7 @@ class ConvOp(OpenMPOp):
                         kshp_logical=kshp_logical,
                         kshp_logical_top_aligned=kshp_logical_top_aligned,
                         version=self.version,
+                        direction_hint='bprop weights',
                         verbose=self.verbose)
 
         else:  # let __init__ choose c params be chosen automatically from shapes
@@ -896,6 +903,7 @@ class ConvOp(OpenMPOp):
                         kshp_logical=kshp_logical,
                         kshp_logical_top_aligned=kshp_logical_top_aligned,
                         version=self.version,
+                        direction_hint='bprop weights',
                         verbose=self.verbose)
 
         dw = dw(img, filters)
@@ -928,6 +936,7 @@ class ConvOp(OpenMPOp):
                          imshp_logical=imshp_logical,
                          kshp_logical=None,
                          version=-1,  # we we change the mode, we don't forward the version.
+                         direction_hint='bprop inputs',
                          verbose=self.verbose)
         else:  # let __init__ figure out the unrolling / patch sizes
             din = ConvOp(imshp, self.kshp, nkern, self.bsize,
@@ -937,6 +946,7 @@ class ConvOp(OpenMPOp):
                          imshp_logical=imshp_logical,
                          kshp_logical=None,
                          version=-1,  # we we change the mode, we don't forward the version.
+                         direction_hint='bprop inputs',
                          verbose=self.verbose)
 
         din = din(gz, filters)
@@ -954,7 +964,7 @@ class ConvOp(OpenMPOp):
         return ['<numpy/noprefix.h>', '<iostream>', '<sstream>']
 
     def c_code_cache_version(self):
-        return (11, self.openmp, blas.blas_header_version())
+        return (13, self.openmp, blas.blas_header_version())
 
     def c_support_code(self):
         return """
@@ -1184,7 +1194,15 @@ if(kerns_dim[3] %% %(self_kshp1)s!=0){
     dim_zz[1] = (int)ceil((dim_im[1]-dim_ker1+1)/float(%(self_dy)s));
   }
 """ % d
-            d["assert_size"] = ""
+            d["assert_size"] = """
+// Check the stack size of the filter and images are equals
+if(kerns_dim[1] != img2d_dim[1]){
+    PyErr_Format(PyExc_ValueError,
+            "the filter stack size (%%ld) and image stack size (%%ld) differ",
+            (long)kerns_dim[1], (long)img2d_dim[1]);
+    %(fail)s;
+}
+            """ % sub
 
         if self.kshp_logical_top_aligned:
             d["self_kshp_logical_offset_r"] = 0
@@ -2147,11 +2165,12 @@ if ((!%(z)s)
 }
 z_arr = (PyArrayObject*) %(z)s;
 
-//assertions
-if (PyArray_STRIDES(%(z)s)[0] != PyArray_DIMS(%(z)s)[1] *PyArray_DIMS(%(z)s)[2] *PyArray_DIMS(%(z)s)[3] * sizeof(%(type)s)) %(fail)s;
-if (PyArray_STRIDES(%(z)s)[1] != PyArray_DIMS(%(z)s)[2] * PyArray_DIMS(%(z)s)[3] * sizeof(%(type)s)) %(fail)s;
-if (PyArray_STRIDES(%(z)s)[2] != PyArray_DIMS(%(z)s)[3] * sizeof(%(type)s)) %(fail)s;
-if (PyArray_STRIDES(%(z)s)[3] != sizeof(%(type)s)) %(fail)s;
+// assert the output is C-contiguous
+if (!PyArray_ISCONTIGUOUS(%(z)s))
+{
+    PyErr_SetString(PyExc_AssertionError, "Output (%(z)s) not contiguous");
+    %(fail)s;
+}
 
 //The if on the number of loop make a speed up for small array.
 //with g++ 4.5.1. The compiler should be smart enough to do this himself!

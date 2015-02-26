@@ -18,9 +18,10 @@ from theano.tensor import elemwise_cgen as cgen
 
 config = theano.config
 
-# We cannot import discrete_dtypes from tensor.basic yet,
+# We cannot import discrete_dtypes or float_dtypes from tensor.basic yet,
 # so we redefine them here
 discrete_dtypes = map(str, scalar.discrete_types)
+float_dtypes = map(str, scalar.float_types)
 
 
 # tensor depends on elemwise to provide definitions for several ops
@@ -182,10 +183,20 @@ class DimShuffle(Op):
         input = as_tensor_variable(_input)
         ib = tuple(input.type.broadcastable)
         if not ib == self.input_broadcastable:
-            raise TypeError((
-                "The number of dimensions and/or broadcastable pattern of the "
-                "input is incorrect for this op. Expected %s, got %s."
-                % (self.input_broadcastable, ib)))
+            if len(ib) != len(self.input_broadcastable):
+                raise TypeError((
+                    "The number of dimensions of the "
+                    "input is incorrect for this op. Expected %s, got %s."
+                    % (self.input_broadcastable, ib)))
+            for expected, b in zip(self.input_broadcastable, ib):
+                if expected is True and b is False:
+                    raise TypeError((
+                        "The broadcastable pattern of the "
+                        "input is incorrect for this op. Expected %s, got %s."
+                        % (self.input_broadcastable, ib)))
+                #else, expected == b or expected is False and b is True
+                # Both case are good.
+
         ob = []
         for value in self.new_order:
             if value == 'x':
@@ -462,14 +473,11 @@ class Elemwise(OpenMPOp):
             the input's storage. (Just like destroymap, but without the lists.)
         * nfunc_spec: either None or a tuple of three elements,
             (nfunc_name, nin, nout) such that getattr(numpy, nfunc_name)
-            implements this operation, takes nin inputs and abs(nout) outputs
-            (nout < 0 if the numpy function does not provide the option of
-            providing a numpy array to store the results in). Note that nin
-            cannot always be inferred from the scalar op's own nin field
-            because that value is sometimes 0 (meaning a variable number of
-            inputs), whereas the numpy function may not have varargs.
-            NOTE: as of now, the sign of the nout field is ignored (some work
-            needs to be done to resize the destinations when needed).
+            implements this operation, takes nin inputs and nout outputs.
+            Note that nin cannot always be inferred from the scalar op's
+            own nin field because that value is sometimes 0 (meaning a
+            variable number of inputs), whereas the numpy function may
+            not have varargs.
         """
         if inplace_pattern is None:
             inplace_pattern = {}
@@ -518,7 +526,8 @@ class Elemwise(OpenMPOp):
         """
         inputs = map(as_tensor_variable, inputs)
         shadow = self.scalar_op.make_node(
-                *[get_scalar_type(dtype=i.type.dtype)() for i in inputs])
+                *[get_scalar_type(dtype=i.type.dtype).make_variable()
+                  for i in inputs])
 
         target_length = max([input.type.ndim for input in inputs])
 
@@ -809,43 +818,24 @@ class Elemwise(OpenMPOp):
                 out_shape.append(max(values))
         out_shape = tuple(out_shape)
 
-        # Commented as we don't reuse outputs now.
-        #
-        # if not self.inplace_pattern:
-        #     for output, storage in izip(node.outputs, output_storage):
-        #         odat = storage[0]
-        #         if odat is not None:
-        #             if odat.shape != out_shape:
-        #                 # It is unsafe to try to resize odat,
-        #                 # we have to allocate output storage.
-        #                 odat = None
-        #         if odat is None:
-        #             odat = numpy.ndarray(out_shape, dtype=output.type.dtype)
-        #         storage[0] = odat
-        # else:
-        #     for i, (output, storage) in enumerate(
-        #             izip(node.outputs, output_storage)):
-        #         #i is an output idx
-        #         if i in self.inplace_pattern:
-        #             odat = inputs[self.inplace_pattern[i]]
-        #         else:
-        #             odat = storage[0]
-        #             if odat is not None:
-        #                 if odat.shape != out_shape:
-        #                     # It is unsafe to try to resize odat,
-        #                     # we have to allocate output storage.
-        #                     odat = None
-        #             if odat is None:
-        #                 odat = numpy.ndarray(out_shape,
-        #                         dtype=output.type.dtype)
-        #         storage[0] = odat
-
-        ufunc_args = inputs  # + output_storage
+        ufunc_args = inputs
+        ufunc_kwargs = {}
         if self.nfunc and len(inputs) == self.nfunc_spec[1]:
             ufunc = self.nfunc
             nout = self.nfunc_spec[2]
-            if nout < 0:
-                nout = -nout
+            # Numpy ufuncs will sometimes perform operations in
+            # float16, in particular when the input is int8.
+            # This is not something that we want, and we do not
+            # do it in the C code, so we specify that the computation
+            # should be carried out in the returned dtype.
+            # This is done via the "sig" kwarg of the ufunc, its value
+            # should be something like "ff->f", where the characters
+            # represent the dtype of the inputs and outputs.
+            out_dtype = node.outputs[0].dtype
+            if out_dtype in float_dtypes and isinstance(ufunc, numpy.ufunc):
+                char = numpy.sctype2char(out_dtype)
+                sig = char * node.nin + '->' + char * node.nout
+                ufunc_kwargs['sig'] = sig
             # Unfortunately, the else case does not allow us to
             # directly feed the destination arguments to the nfunc
             # since it sometimes requires resizing. Doing this
@@ -859,7 +849,7 @@ class Elemwise(OpenMPOp):
                                       self.scalar_op.nout))
             nout = ufunc.nout
 
-        variables = ufunc(*ufunc_args)
+        variables = ufunc(*ufunc_args, **ufunc_kwargs)
 
         if nout == 1:
             variables = [variables]
@@ -1040,9 +1030,9 @@ class Elemwise(OpenMPOp):
         # We generate the C code of the inner loop using the scalar op
         task_code = self.scalar_op.c_code(
                 Apply(self.scalar_op,
-                      [get_scalar_type(dtype=input.type.dtype)()
+                      [get_scalar_type(dtype=input.type.dtype).make_variable()
                           for input in node.inputs],
-                      [get_scalar_type(dtype=output.type.dtype)()
+                      [get_scalar_type(dtype=output.type.dtype).make_variable()
                           for output in node.outputs]),
                 nodename + '_scalar_',
                 ["%s_i" % s for s in _inames],
@@ -1193,8 +1183,10 @@ class Elemwise(OpenMPOp):
 
         # now we insert versions for the ops on which we depend...
         scalar_node = Apply(self.scalar_op,
-                [get_scalar_type(dtype=input.type.dtype)() for input in node.inputs],
-                [get_scalar_type(dtype=output.type.dtype)() for output in node.outputs])
+                [get_scalar_type(dtype=input.type.dtype).make_variable()
+                 for input in node.inputs],
+                [get_scalar_type(dtype=output.type.dtype).make_variable()
+                 for output in node.outputs])
         version.append(self.scalar_op.c_code_cache_version_apply(scalar_node))
         for i in node.inputs + node.outputs:
             version.append(get_scalar_type(dtype=i.type.dtype).c_code_cache_version())
@@ -1203,6 +1195,13 @@ class Elemwise(OpenMPOp):
             return tuple(version)
         else:
             return ()
+
+    def python_constant_folding(self, node):
+        """
+        Return True if we do not want to compile c code
+        when doing constant folding of this node.
+        """
+        return node.outputs[0].ndim == 0
 
 # def elemwise_to_scal(fgraph):
 # TODO: why is this commented out? should it be removed?
@@ -1564,9 +1563,9 @@ for(int i=0;i<PyArray_NDIM(%(iname)s);i++){
         task1_code = self.scalar_op.c_code(
                 Apply(
                     self.scalar_op,
-                    [get_scalar_type(dtype=input.type.dtype)()
+                    [get_scalar_type(dtype=input.type.dtype).make_variable()
                         for input in (node.inputs * 2)],
-                    [get_scalar_type(dtype=output.type.dtype)()
+                    [get_scalar_type(dtype=output.type.dtype).make_variable()
                         for input in node.outputs]),
                 None,
                 ["%s_i" % aname, "%s_i" % inames[0]],
@@ -1616,8 +1615,10 @@ for(int i=0;i<PyArray_NDIM(%(iname)s);i++){
 
         # now we insert versions for the ops on which we depend...
         scalar_node = Apply(self.scalar_op,
-                [get_scalar_type(dtype=input.type.dtype)() for input in node.inputs],
-                [get_scalar_type(dtype=output.type.dtype)() for output in node.outputs])
+                [get_scalar_type(dtype=input.type.dtype).make_variable()
+                 for input in node.inputs],
+                [get_scalar_type(dtype=output.type.dtype).make_variable()
+                 for output in node.outputs])
         version.append(self.scalar_op.c_code_cache_version_apply(scalar_node))
         for i in node.inputs + node.outputs:
             version.append(get_scalar_type(dtype=i.type.dtype).c_code_cache_version())

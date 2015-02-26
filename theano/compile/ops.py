@@ -4,6 +4,7 @@ and Ops building class (:class:`FromFunctionOp`) and decorator
 
 """
 import copy
+import cPickle
 import warnings
 
 import theano
@@ -387,6 +388,46 @@ class Shape_i(gof.Op):
         return [None]
 
 
+def shape_i(var, i, fgraph=None):
+    """Equivalent of var.shape[i], but apply if possible the shape
+    feature optimization
+
+    This is useful in optimization that need to get the shape. This
+    remove the need of the following shape_feature optimization that
+    convert it. So this speed up optimization and remove Equilibrium
+    max iteration problems.
+
+    :param var: the variable we want to take the shape of
+    :param i: The shape dimensions we want
+    :param fgraph: optional. If var.fgraph do not exist, the fgraph that
+        have the shape_feature to introduce var in to get the optimized shape.
+
+    """
+    if fgraph is None and hasattr(var, 'fgraph'):
+        fgraph = var.fgraph
+    if fgraph and hasattr(fgraph, 'shape_feature'):
+        shape_feature = fgraph.shape_feature
+        shape_of = shape_feature.shape_of
+
+        def recur(node):
+            if not hasattr(node.outputs[0], 'fgraph'):
+                for inp in node.inputs:
+                    if inp.owner:
+                        recur(inp.owner)
+                # If the output var isn't marked as being in the graph,
+                # we need to att it in the ShapeFeature.
+                shape_feature.on_import(fgraph, node,
+                                    'gof.ops.shape_i')
+        if var not in shape_of:
+            recur(var.owner)
+        return shape_of[var][i]
+
+    # If we are not able to use the shape feature, we should not put
+    # Shape_i in the graph. Otherwise, the shape feature optimization
+    # won't get applied.
+    return var.shape[i]
+
+
 def register_shape_i_c_code(typ, code, check_input, version=()):
     """ Tell Shape_i how to generate C code for a Theano Type
 
@@ -461,16 +502,19 @@ class FromFunctionOp(gof.Op):
         try:
             obj = load_back(mod, name)
         except (ImportError, KeyError, AttributeError):
-            raise PicklingError("Can't pickle as_op(), not found as %s.%s" %
-                                (mod, name))
+            raise cPickle.PicklingError(
+                "Can't pickle as_op(), not found as %s.%s" %
+                (mod, name))
         else:
             if obj is not self:
-                raise PicklingError("Can't pickle as_op(), not the object "
-                                    "at %s.%s" % (mod, name))
+                raise cPickle.PicklingError(
+                    "Can't pickle as_op(), not the object "
+                    "at %s.%s" % (mod, name))
         return load_back, (mod, name)
 
     def _infer_shape(self, node, input_shapes):
         return self.__infer_shape(node, input_shapes)
+
 
 def as_op(itypes, otypes, infer_shape=None):
     """
@@ -570,7 +614,7 @@ class Rebroadcast(gof.Op):
 
     def __hash__(self):
         items = sorted(self.axis.iteritems())  # no ambiguity because each item key is unique
-        return hash(type(self)) ^ hash(tuple(items))
+        return hash((type(self), tuple(items)))
 
     def __str__(self):
         if len(self.axis) == 0:
@@ -585,11 +629,10 @@ class Rebroadcast(gof.Op):
 
     def make_node(self, x):
         if self.axis.keys() and (x.ndim <= numpy.max(self.axis.keys())):
-            raise ValueError('Trying to rebroadcast nonexistant dimension')
-        t = x.type.__class__(dtype=x.type.dtype,
-                             broadcastable=[self.axis.get(i, b)
-                                            for i, b in enumerate(
-                                                x.type.broadcastable)])
+            raise ValueError('Trying to rebroadcast non-existent dimension')
+        t = x.type.clone(broadcastable=[self.axis.get(i, b)
+                                        for i, b in enumerate(
+                    x.type.broadcastable)])
         return gof.Apply(self, [x], [t()])
 
     def perform(self, node, inp, out_):

@@ -567,12 +567,28 @@ PyObject * CudaNdarray_CreateArrayObj(CudaNdarray * self, PyObject *args)
 PyObject* CudaNdarray_ZEROS(int n, int * dims)
 {
 
-    int total_elements = 1;
-    for(int i=0;i<n;i++)
+    size_t total_elements = 1;
+
+    for(size_t i=0;i<n;i++){
+        // Detect overflow on unsigned integer
+        if (dims[i] != 0 && total_elements > (SIZE_MAX / dims[i])) {
+            PyErr_Format(PyExc_RuntimeError,
+                         "Can't store in size_t for the bytes requested %llu * %llu",
+                         (unsigned long long)total_elements,
+                         (unsigned long long)dims[i]);
+            return NULL;
+        }
         total_elements*=dims[i];
+    }
 
     // total_elements now contains the size of the array, in reals
-    int total_size = total_elements * sizeof(real);
+    if (total_elements > (SIZE_MAX / sizeof(real))){
+        PyErr_Format(PyExc_RuntimeError,
+                     "Can't store in size_t for the bytes requested %llu * 4",
+                     (unsigned long long)total_elements);
+        return NULL;
+    }
+    size_t total_size = total_elements * sizeof(real);
 
     CudaNdarray* rval = (CudaNdarray*)CudaNdarray_New();
     if (!rval)
@@ -592,7 +608,9 @@ PyObject* CudaNdarray_ZEROS(int n, int * dims)
     //fprintf(stdout, "Sizeof: %d\n", total_size);
     if (cudaSuccess != cudaMemset(rval->devdata, 0, total_size))
     {
-        PyErr_Format(PyExc_MemoryError, "CudaNdarray_ZEROS: Error memsetting %d bytes of device memory.", total_size);
+        PyErr_Format(PyExc_MemoryError,
+                     "CudaNdarray_ZEROS: Error memsetting %llu bytes of device memory.",
+                     (unsigned long long)total_size);
         Py_DECREF(rval);
         return NULL;
     }
@@ -1272,8 +1290,7 @@ CudaNdarray_TakeFrom(CudaNdarray * self, PyObject *args){
     if (cpu_err_var != 0) {
         PyErr_Format(
             PyExc_IndexError,
-            "Cuda error: %s: The error code on the gpu is %i.\n",
-            "CudaNdarray_TakeFrom",
+            "CudaNdarray_TakeFrom: One of the index value is out of bound.\n",
             cpu_err_var);
         // Must reset it to 0 to don't reset it before each use.
         err = cudaMemset((void*)err_var, 0, sizeof(int));
@@ -1760,7 +1777,7 @@ CudaNdarray_inplace_elemwise(PyObject* py_self, PyObject * py_other, operator_t 
                 {
                     PyErr_Format(
                         PyExc_RuntimeError,
-                        "Cuda error: %s: %s.\n",
+                        "CudaNdarray_inplace_elemwise case0: Cuda error: %s: %s.\n",
                         "k3",
                         cudaGetErrorString(err));
                     Py_XDECREF(new_other);
@@ -1793,7 +1810,7 @@ CudaNdarray_inplace_elemwise(PyObject* py_self, PyObject * py_other, operator_t 
                 {
                     PyErr_Format(
                         PyExc_RuntimeError,
-                        "Cuda error: %s: %s.\n",
+                        "CudaNdarray_inplace_elemwise case1: Cuda error: %s: %s.\n",
                         "k3",
                         cudaGetErrorString(err));
                     Py_XDECREF(new_other);
@@ -1831,7 +1848,7 @@ CudaNdarray_inplace_elemwise(PyObject* py_self, PyObject * py_other, operator_t 
                 {
                     PyErr_Format(
                         PyExc_RuntimeError,
-                        "Cuda error: %s: %s.\n",
+                        "CudaNdarray_inplace_elemwise case2: Cuda error: %s: %s.\n",
                         "k3",
                         cudaGetErrorString(err));
                     Py_XDECREF(new_other);
@@ -1872,7 +1889,7 @@ CudaNdarray_inplace_elemwise(PyObject* py_self, PyObject * py_other, operator_t 
                 {
                     PyErr_Format(
                         PyExc_RuntimeError,
-                        "Cuda error: %s: %s.\n",
+                        "CudaNdarray_inplace_elemwise case3: Cuda error: %s: %s.\n",
                         "k3",
                         cudaGetErrorString(err));
                     Py_XDECREF(new_other);
@@ -1917,7 +1934,7 @@ CudaNdarray_inplace_elemwise(PyObject* py_self, PyObject * py_other, operator_t 
                 {
                     PyErr_Format(
                         PyExc_RuntimeError,
-                        "Cuda error: %s: %s.\n",
+                        "CudaNdarray_inplace_elemwise case4: Cuda error: %s: %s.\n",
                         "k4",
                         cudaGetErrorString(err));
                     Py_XDECREF(new_other);
@@ -1963,7 +1980,7 @@ CudaNdarray_inplace_elemwise(PyObject* py_self, PyObject * py_other, operator_t 
                     {
                         PyErr_Format(
                             PyExc_RuntimeError,
-                            "Cuda error: %s: %s. n_block=(%ld,%ld) n_threads=%ld\n",
+                            "CudaNdarray_inplace_elemwise case5: Cuda error: %s: %s. n_block=(%ld,%ld) n_threads=%ld\n",
                             "k5 with loop over k4",
                             cudaGetErrorString(err),
                             (long) n_blocks.x, (long) n_blocks.y, (long) n_threads.x);
@@ -2023,7 +2040,7 @@ CudaNdarray_inplace_elemwise(PyObject* py_self, PyObject * py_other, operator_t 
                 {
                     PyErr_Format(
                         PyExc_RuntimeError,
-                        "Cuda error: %s: %s. n_blocks=(%ld, %ld, %ld) n_threads=(%ld)\n",
+                        "CudaNdarray_inplace_elemwise case6: Cuda error: %s: %s. n_blocks=(%ld, %ld, %ld) n_threads=(%ld)\n",
                         "k6",
                         cudaGetErrorString(err),
                         (long) n_blocks.x, (long) n_blocks.y, (long) n_blocks.z,
@@ -2714,13 +2731,13 @@ CudaNdarray_get_dev_data(CudaNdarray *self, void *closure)
 {
     float * p =  CudaNdarray_DEV_DATA(self);
     //printf("get_dev_data %p %li \n", p, (long int)p );
-    return PyInt_FromLong((long int) CudaNdarray_DEV_DATA(self));
+    return PyInt_FromSize_t((size_t) CudaNdarray_DEV_DATA(self));
 }
 
 static int
 CudaNdarray_set_dev_data(CudaNdarray *self, PyObject *value, void *closure)
 {
-    long int newdevdata = PyInt_AsLong(value);
+    Py_ssize_t newdevdata = PyInt_AsSsize_t(value);
     //printf("set_dev_data %p %li \n",(float*)newdevdata ,newdevdata);
     if (PyErr_Occurred())
     {
@@ -3025,15 +3042,17 @@ CudaNdarray_ptr_int_size(PyObject* _unused, PyObject* args)
 {
     int *gpu_data = (int*)device_malloc(sizeof(int)*2);
     if(gpu_data == NULL){
-        return PyErr_Format(PyExc_MemoryError,
-                            "CudaNdarray_ptr_int_size: Can't allocate memory on the gpu.");
+        return NULL;
     }
     get_gpu_ptr_size<<<1,1>>>(gpu_data);
-    if (cudaSuccess != cudaGetLastError()){
+
+    cudaError_t cudaErr = cudaGetLastError();
+    if (cudaSuccess != cudaErr){
 
         device_free(gpu_data);
         return PyErr_Format(PyExc_RuntimeError,
-                            "CudaNdarray_ptr_int_size: error when calling the gpu code.");
+                            "CudaNdarray_ptr_int_size: error when calling the gpu code. (%s)",
+                            cudaGetErrorString(cudaErr));
     }
 
     // Transfer the result to cpu
@@ -3046,7 +3065,8 @@ CudaNdarray_ptr_int_size(PyObject* _unused, PyObject* args)
         PyErr_SetString(PyExc_RuntimeError, "error copying data to from memory");
         return NULL;
     }
-    return Py_BuildValue("iiii", gpu_sizes[0], sizeof(float*), sizeof(int), gpu_sizes[1]);
+    return Py_BuildValue("iiii", (int) gpu_sizes[0], (int)sizeof(float*),
+                         (int)sizeof(int), (int) gpu_sizes[1]);
 }
 
 static int cublas_init();

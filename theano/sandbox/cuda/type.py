@@ -7,7 +7,6 @@ import warnings
 import numpy
 
 import theano
-from theano import config
 from theano import Type, Variable
 from theano import tensor, config
 from theano import scalar as scal
@@ -71,6 +70,11 @@ class CudaNdarrayType(Type):
         self.broadcastable = tuple(broadcastable)
         self.name = name
         self.dtype_specs()  # error checking is done there
+
+    def clone(self, dtype=None, broadcastable=None):
+        if broadcastable is None:
+            broadcastable = self.broadcastable
+        return self.__class__(broadcastable, name=self.name, dtype=dtype)
 
     def filter(self, data, strict=False, allow_downcast=None):
         return self.filter_inplace(data, None, strict=strict,
@@ -228,6 +232,13 @@ class CudaNdarrayType(Type):
         return (type(self) == type(other) and
                 other.broadcastable == self.broadcastable)
 
+    def convert_variable(self, var):
+        if (type(self) == type(var.type) and
+            self.ndim == var.type.ndim and
+            all(sb == ob or ob for sb, ob in zip(self.broadcastable,
+                                                 var.type.broadcastable))):
+            return theano.tensor.patternbroadcast(var, self.broadcastable)
+
     def __hash__(self):
         """Hash equal for same kinds of CudaNdarrayType"""
         return hash(type(self)) ^ hash(self.broadcastable)
@@ -280,7 +291,8 @@ class CudaNdarrayType(Type):
     def c_init(self, name, sub):
         return "%(name)s = NULL;" % locals()
 
-    def c_extract(self, name, sub, check_input=True):
+    def c_extract(self, name, sub, check_input=True,
+                  check_broadcast=True):
         sio = StringIO()
         fail = sub['fail']
         nd = self.ndim
@@ -307,7 +319,7 @@ class CudaNdarrayType(Type):
                 //std::cerr << "c_extract " << %(name)s << " nd check passed\\n";
             """ % locals()
             for i, b in enumerate(self.broadcastable):
-                if b:
+                if b and check_broadcast:
                     print >> sio, """
                 if (CudaNdarray_HOST_DIMS(%(name)s)[%(i)s] != 1)
                 {
@@ -359,6 +371,24 @@ class CudaNdarrayType(Type):
             """ % locals()
         #print sio.getvalue()
         return sio.getvalue()
+
+    def c_extract_out(self, name, sub, check_input=True, check_broadcast=True):
+        """ To allow the hack to skip check_broadcast.
+        """
+        return """
+        if (py_%(name)s == Py_None)
+        {
+            %(c_init_code)s
+        }
+        else
+        {
+            %(c_extract_code)s
+        }
+        """ % dict(
+            name=name,
+            c_init_code=self.c_init(name, sub),
+            c_extract_code=self.c_extract(name, sub, check_input,
+                                          check_broadcast))
 
     def c_cleanup(self, name, sub):
         return """

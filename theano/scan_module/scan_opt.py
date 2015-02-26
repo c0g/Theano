@@ -470,10 +470,10 @@ class PushOutSeqScan(gof.Optimizer):
                         outside_ins = replace_with_out[to_replace.index(x)]
                     new_ord = (0,)
                     for old_ord in nd.op.new_order:
-                        if isinstance(old_ord, int):
-                            new_ord += (old_ord + 1,)
-                        else:
+                        if (old_ord == 'x'):
                             new_ord += (old_ord,)
+                        else:
+                            new_ord += (old_ord + 1,)
                     new_outer = outside_ins.dimshuffle(new_ord)
                     y = nd.outputs[0]
                     y_place_holder = scan_utils.safe_new(y, '_replace')
@@ -583,11 +583,341 @@ class PushOutSeqScan(gof.Optimizer):
             return False
 
 
+class PushOutScanOutput(gof.Optimizer):
+    """
+    This optimization can push operations performed at the end of the inner
+    graph of scan to outside of scan
+    """
+
+    def __init__(self):
+        gof.Optimizer.__init__(self)
+
+    def add_requirements(self, fgraph):
+        fgraph.attach_feature(gof.toolbox.ReplaceValidate())
+
+    def apply(self, fgraph):
+        nodelist = [x for x in fgraph.toposort()
+                    if isinstance(x.op, scan_op.Scan)]
+        for node in nodelist:
+            # Process the node as long as something gets optimized
+            while node != None:
+                node = self.process_node(fgraph, node)
+
+    def process_node(self, fgraph, node):
+
+        op = node.op
+
+        # Use scan_args to parse the inputs and outputs of scan for ease of
+        # use
+        args = scan_args(node.inputs, node.outputs,
+                         node.op.inputs, node.op.outputs, node.op.info)
+
+        local_fgraph = gof.FunctionGraph(args.inner_inputs,
+                                         args.inner_outputs,
+                                         clone=False)
+
+        new_scan_node = None
+
+        for nd in local_fgraph.toposort():
+
+            if (isinstance(nd.op, theano.tensor.Dot) and
+                nd.out in args.inner_out_nit_sot):
+
+                """
+                The following optimization involves pushing out, after the
+                scan, a Dot whose output is nitsot (not feed back to the inner
+                graph) and where one input is one of scan's input with ndim=2
+                and the other is an intermediate variable in the Scan inner
+                graph with ndim=1.
+
+                The Dot product is pushed out of the scan and its inputs are
+                now the original matrix and a new matrix obtained by
+                concatenating the vectors into a matrix.
+                """
+
+                # Ensure that the output of the Dot is used in the outer
+                # graph to avoid apply the optimization needlessly
+                dot_out_nitsot_idx = args.inner_out_nit_sot.index(nd.out)
+                outer_dot_output = args.outer_out_nit_sot[dot_out_nitsot_idx]
+                if len(outer_dot_output.clients) == 0:
+                    continue
+
+                """
+                Validate that one of the inputs is a matrix AND a
+                non-sequence input to scan and that the other input is a
+                vector and either an sequence input to scan or the result
+                of computation in the inner function of scan.
+                """
+                valid_inputs = False
+                idx_matrix_input = -1
+                idx_vector_input = -1
+
+                if (nd.inputs[0].ndim == 2 and
+                    (nd.inputs[0] in args.inner_in_non_seqs or
+                     isinstance(nd.inputs[0], tensor.Constant)) and
+                    nd.inputs[1].ndim == 1 and
+                      (nd.inputs[1] in args.inner_in_seqs or
+                       nd.inputs[1] not in args.inner_inputs)):
+
+                    valid_inputs = True
+                    idx_matrix_input = 0
+                    idx_vector_input = 1
+
+                elif (nd.inputs[1].ndim == 2 and
+                      (nd.inputs[1] in args.inner_in_non_seqs or
+                       isinstance(nd.inputs[1], tensor.Constant)) and
+                      nd.inputs[0].ndim == 1 and
+                      (nd.inputs[0] in args.inner_in_seqs or
+                       nd.inputs[0] not in args.inner_inputs)):
+
+                    valid_inputs = True
+                    idx_matrix_input = 1
+                    idx_vector_input = 0
+
+
+                if valid_inputs:
+                    # The optimization can be applied on the current Dot
+
+                    # Move out of scan the two inputs to the Dot
+                    (outer_vars,
+                     new_scan_node,
+                     new_scan_args) = self.push_out_inner_vars(fgraph,
+                                                               nd.inputs,
+                                                               node, args)
+                    outer_vector_input = outer_vars[idx_vector_input]
+                    outer_matrix_input = outer_vars[idx_matrix_input]
+
+                    # Perform the Dot outside of scan
+                    if idx_matrix_input == 0:
+                        outer_dot_inputs = [outer_vector_input,
+                                            outer_matrix_input.transpose()]
+                        outer_dot_output = theano.tensor.dot(*outer_dot_inputs)
+                    else: # idx_matrix_input == 1
+                        outer_dot_inputs = [outer_vector_input,
+                                            outer_matrix_input]
+                        outer_dot_output = theano.tensor.dot(*outer_dot_inputs)
+
+                    # Modify the outer graph to add the outer Dot
+                    fgraph.replace_all([
+                           (new_scan_args.outer_out_nit_sot[dot_out_nitsot_idx],
+                            outer_dot_output)],
+                           reason="scanOp_pushout_output")
+
+                    break
+
+            elif (isinstance(nd.op, theano.tensor.elemwise.Elemwise) and
+                  isinstance(nd.op.nfunc, numpy.ufunc) and
+                  nd.op.nfunc.__name__ == 'add' and
+                  nd.out in args.inner_out_sit_sot and
+                  self.inner_sitsot_only_last_step_used(nd.out, args)):
+
+                # Ensure that one of the input to the add is the output of
+                # the add from a previous iteration of the inner function
+                sitsot_idx = args.inner_out_sit_sot.index(nd.out)
+                if args.inner_in_sit_sot[sitsot_idx] in nd.inputs:
+
+                    # Ensure that the other input to the add is a dot product
+                    # between 2 matrices which will become a tensor3 and a
+                    # matrix if pushed outside of the scan. Also make sure
+                    # that the output of the Dot is ONLY used by the 'add'
+                    # otherwise doing a Dot in the outer graph will only
+                    # duplicate computation.
+
+                    sitsot_in_idx = nd.inputs.index(args.inner_in_sit_sot[sitsot_idx])
+
+                    dot_in_idx = 1 - sitsot_in_idx # 0 if sitsot_in_idx==1,
+                                                   # 1 if sitsot_in_idx==0
+                    dot_input = nd.inputs[dot_in_idx]
+
+                    if (dot_input.owner is not None and
+                        isinstance(dot_input.owner.op, theano.tensor.Dot) and
+                        len(dot_input.clients) == 1 and
+                        dot_input.owner.inputs[0].ndim == 2 and
+                        dot_input.owner.inputs[1].ndim == 2 and
+                        self.get_outer_ndim(dot_input.owner.inputs[0], args) == 3 and
+                        self.get_outer_ndim(dot_input.owner.inputs[1], args) == 3):
+
+                        # The optimization can be be applied in this case.
+
+                        # Move out of scan the two inputs to the Dot and
+                        # perform a dot outside of scan on these two inputs
+                        inner_dot_inputs = nd.inputs[dot_in_idx].owner.inputs
+                        (outer_dot_inputs,
+                         new_scan_node,
+                         new_scan_args) = self.push_out_inner_vars(fgraph,
+                                                                   inner_dot_inputs,
+                                                                   node, args)
+
+
+                        # Collapse some of the dimensions of the tensors
+                        # so that they become matrices. This is because a
+                        # dot is usually faster on two large matrices than
+                        # a bunch of small ones
+                        outer_dot_inputs[0] = theano.tensor.flatten(
+                                       outer_dot_inputs[0].dimshuffle(1,0,2),
+                                       outdim=2)
+
+                        shape_input1 = theano.tensor.shape(outer_dot_inputs[1])
+                        outer_dot_inputs[1] = outer_dot_inputs[1].reshape((shape_input1[0] *
+                                                                           shape_input1[1],
+                                                                           shape_input1[2]))
+
+                        # Perform the dot on the newly obtained matrices and
+                        # add the initial value
+                        outer_dot_output = theano.tensor.dot(*outer_dot_inputs)
+                        init_value = new_scan_args.outer_in_sit_sot[sitsot_idx][0]
+                        replacement = outer_dot_output + init_value
+
+                        # Alter the outer graph to use the output of the
+                        # external Dot instead of the output of scan
+                        # Modify the outer graph to add the outer Dot
+                        outer_sitsot = new_scan_args.outer_out_sit_sot[sitsot_idx]
+                        subtensor_node = outer_sitsot.clients[0][0]
+                        outer_sitsot_last_step = subtensor_node.outputs[0]
+
+                        fgraph.replace_all([
+                            (outer_sitsot_last_step, replacement)],
+                            reason="scanOp_pushout_output")
+
+                        break
+
+        return new_scan_node
+
+    def inner_sitsot_only_last_step_used(self, var, scan_args):
+        """
+        Given a inner nit_sot output of scan, return True iff the outer
+        nit_sot output has only one client and that client is a Subtensor
+        instance that takes only the last step (last element along the first
+        axis).
+        """
+        idx = scan_args.inner_out_sit_sot.index(var)
+        outer_var = scan_args.outer_out_sit_sot[idx]
+
+        if len(outer_var.clients) == 1:
+
+            client = outer_var.clients[0][0]
+
+            if (client != 'output' and
+                isinstance(client.op, theano.tensor.Subtensor)):
+                lst = theano.tensor.subtensor.get_idx_list(
+                    client.inputs, client.op.idx_list)
+                if (len(lst) == 1 and
+                    theano.tensor.extract_constant(lst[0]) == -1):
+                    return True
+
+        return False
+
+    def get_outer_ndim(self, var, scan_args):
+
+        # Given a variable, determine the number of dimension it would have if
+        # it was pushed out of scan
+        if (var in scan_args.inner_in_non_seqs or
+            isinstance(var, theano.Constant)):
+
+            outer_ndim = var.ndim
+        else:
+            outer_ndim = var.ndim + 1
+
+        return outer_ndim
+
+    def push_out_inner_vars(self, fgraph, inner_vars, old_scan_node,
+                            old_scan_args):
+
+        outer_vars = [None] * len(inner_vars)
+        new_scan_node = old_scan_node
+        new_scan_args = old_scan_args
+
+        # For the inner_vars that already exist in the outer graph,
+        # simply obtain a reference to them
+        for idx in range(len(inner_vars)):
+
+            var = inner_vars[idx]
+
+            if var in old_scan_args.inner_in_seqs:
+                idx_seq = old_scan_args.inner_in_seqs.index(var)
+                outer_vars[idx] = old_scan_args.outer_in_seqs[idx_seq]
+
+            elif var in old_scan_args.inner_in_non_seqs:
+                idx_non_seq = old_scan_args.inner_in_non_seqs.index(var)
+                outer_vars[idx] = old_scan_args.outer_in_non_seqs[idx_non_seq]
+
+            elif isinstance(var, theano.Constant):
+                outer_vars[idx] = var.clone()
+
+            elif var in old_scan_args.inner_out_nit_sot:
+                idx_nitsot = old_scan_args.inner_out_nit_sot.index(var)
+                outer_vars[idx] = old_scan_args.outer_out_nit_sot[idx_nitsot]
+
+        # For the inner_vars that don't already exist in the outer graph, add
+        # them as new nitsot outputs to the scan node.
+        idx_add_as_nitsots = [i for i in range(len(outer_vars))
+                              if outer_vars[i] == None]
+        add_as_nitsots = [inner_vars[idx] for idx in idx_add_as_nitsots]
+
+        if len(add_as_nitsots) > 0:
+
+            new_scan_node = self.add_nitsot_outputs(fgraph,old_scan_node,
+                                                    old_scan_args,
+                                                    add_as_nitsots)
+
+            new_scan_args = scan_args(new_scan_node.inputs,
+                                      new_scan_node.outputs,
+                                      new_scan_node.op.inputs,
+                                      new_scan_node.op.outputs,
+                                      new_scan_node.op.info)
+
+            new_outs = new_scan_args.outer_out_nit_sot[-len(add_as_nitsots):]
+            for i in range(len(new_outs)):
+                outer_vars[idx_add_as_nitsots[i]] = new_outs[i]
+
+        return outer_vars, new_scan_node, new_scan_args
+
+    def add_nitsot_outputs(self, fgraph, old_scan_node,
+                           old_scan_args, new_outputs_inner):
+
+        nb_new_outs = len(new_outputs_inner)
+
+        # Create the initial values for the new nitsot outputs
+        # (the initial value is the nb of steps to store. For a nistot,
+        # it should be the number of steps performed by scan)
+        new_nitsots_initial_value = [old_scan_node.inputs[0]
+                                     for i in range(nb_new_outs)]
+
+        # Create the scan_args corresponding to the new scan op to
+        # create
+        new_scan_args = copy.copy(old_scan_args)
+        new_scan_args.inner_out_nit_sot.extend(new_outputs_inner)
+        new_scan_args.outer_in_nit_sot.extend(new_nitsots_initial_value)
+
+        # Create the scan op from the scan_args
+        new_scan_op = scan_op.Scan(new_scan_args.inner_inputs,
+                                   new_scan_args.inner_outputs,
+                                   new_scan_args.info)
+
+        # Create the Apply node for the scan op
+        new_scan_node = new_scan_op(*new_scan_args.outer_inputs,
+                                    **dict(return_list=True))[0].owner
+
+        # Modify the outer graph to make sure the outputs of the new scan are
+        # used instead of the outputs of the old scan
+        new_node_new_outputs_idx = (len(old_scan_args.outer_outputs) -
+                                    len(old_scan_args.outer_out_shared))
+
+        new_node_old_outputs = (
+                new_scan_node.outputs[:new_node_new_outputs_idx] +
+                new_scan_node.outputs[new_node_new_outputs_idx+nb_new_outs:])
+
+        fgraph.replace_all_validate_remove(
+            zip(old_scan_node.outputs, new_node_old_outputs),
+            remove=[old_scan_node],
+            reason='scanOp_pushout_output')
+
+        return new_scan_node
+
 class ScanInplaceOptimizer(Optimizer):
     """Graph optimizer for Scan(makes it run inplace)"""
-    def __init__(self, typeConstructor=None, gpu_flag=False, gpua_flag=False):
+    def __init__(self, gpu_flag=False, gpua_flag=False):
         Optimizer.__init__(self)
-        self.typeConstructor = typeConstructor
         self.gpu_flag = gpu_flag
         self.gpua_flag = gpua_flag
 
@@ -629,8 +959,7 @@ class ScanInplaceOptimizer(Optimizer):
                 inputs = ls_begin + ls + ls_end
                 new_op = scan_op.Scan(op.inputs,
                                       op.outputs,
-                                      info,
-                                      typeConstructor=self.typeConstructor)
+                                      info)
 
                 # Do not call make_node for test_value
                 new_outs = new_op(*inputs, **dict(return_list=True))
@@ -1171,6 +1500,7 @@ class ScanMerge(gof.Optimizer):
         info['gpu'] = False
         info['as_while'] = as_while
         info['profile'] = nodes[0].op.profile
+        info['allow_gc'] = nodes[0].op.allow_gc
 
         # We keep the inner_ins and inner_outs of each original node separated.
         # To be able to recombine them in the right order after the clone,
@@ -1453,10 +1783,7 @@ def scan_merge_inouts(node):
         inner_inputs = a.inner_inputs
         outer_inputs = a.outer_inputs
         info = a.info
-        if info['as_while']:
-            a_inner_outs = a.inner_outputs + a.cond
-        else:
-            a_inner_outs = a.inner_outputs
+        a_inner_outs = a.inner_outputs
         inner_outputs = scan_utils.clone(a_inner_outs, replace=inp_equiv)
 
         op = scan_op.Scan(inner_inputs, inner_outputs, info)
@@ -1758,8 +2085,7 @@ scan_eqopt2 = theano.gof.EquilibriumDB()
 optdb.register('scan_eqopt1', scan_eqopt1, .1, 'fast_run', 'scan')
 optdb.register('scan_eqopt2', scan_eqopt2, 1.6, 'fast_run', 'scan')
 optdb.register('scanOp_make_inplace',
-               ScanInplaceOptimizer(typeConstructor=None,
-                                    gpu_flag=False),
+               ScanInplaceOptimizer(),
                75,
                'fast_run',
                'inplace',
@@ -1795,6 +2121,14 @@ scan_seqopt1.register('scanOp_pushout_seqs_ops',
 scan_seqopt1.register('scan_pushout_dot1',
                       PushOutDot1(),
                       4,
+                      'fast_run',
+                      'more_mem',
+                      'scan')
+
+
+scan_seqopt1.register('scanOp_pushout_output',
+                      PushOutScanOutput(),
+                      5,
                       'fast_run',
                       'more_mem',
                       'scan')

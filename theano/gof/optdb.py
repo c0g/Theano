@@ -32,7 +32,21 @@ class DB(object):
         self.name = None  # will be reset by register
         #(via obj.name by the thing doing the registering)
 
-    def register(self, name, obj, *tags):
+    def register(self, name, obj, *tags, **kwargs):
+        """
+        :param name: name of the optimizer.
+        :param obj: the optimizer to register.
+        :param tags: tag name that allow to select the optimizer.
+        :param kwargs: If non empty, should contain
+            only use_db_name_as_tag=False.
+            By default, all optimizations registered in EquilibriumDB
+            are selected when the EquilibriumDB name is used as a
+            tag. We do not want this behavior for some optimizer like
+            local_remove_all_assert. use_db_name_as_tag=False remove
+            that behavior. This mean only the optimizer name and the
+            tags specified will enable that optimization.
+
+        """
         # N.B. obj is not an instance of class Optimizer.
         # It is an instance of a DB.In the tests for example,
         # this is not always the case.
@@ -42,9 +56,12 @@ class DB(object):
             raise ValueError('The name of the object cannot be an existing'
                              ' tag or the name of another existing object.',
                              obj, name)
-
-        if self.name is not None:
-            tags = tags + (self.name,)
+        if kwargs:
+            assert "use_db_name_as_tag" in kwargs
+            assert kwargs["use_db_name_as_tag"] is False
+        else:
+            if self.name is not None:
+                tags = tags + (self.name,)
         obj.name = name
         # This restriction is there because in many place we suppose that
         # something in the DB is there only once.
@@ -155,6 +172,10 @@ class Query(object):
         if isinstance(self.exclude, (list, tuple)):
             self.exclude = OrderedSet(self.exclude)
 
+    def __str__(self):
+        return "Query{inc=%s,ex=%s,require=%s,subquery=%s,position_cutoff=%d}" % (
+            self.include, self.exclude, self.require, self.subquery, self.position_cutoff)
+
     #add all opt with this tag
     def including(self, *tags):
         return Query(self.include.union(tags),
@@ -223,6 +244,7 @@ class SequenceDB(DB):
     other tags) fast_run and fast_compile optimizers are drawn is a SequenceDB.
 
     """
+    seq_opt = opt.SeqOptimizer
 
     def __init__(self, failure_callback=opt.SeqOptimizer.warn):
         super(SequenceDB, self).__init__()
@@ -256,13 +278,16 @@ class SequenceDB(DB):
         # the order we want.
         opts.sort(key=lambda obj: obj.name)
         opts.sort(key=lambda obj: self.__position__[obj.name])
-        ret = opt.SeqOptimizer(opts, failure_callback=self.failure_callback)
+        kwargs = {}
+        if self.failure_callback:
+            kwargs["failure_callback"] = self.failure_callback
+        ret = self.seq_opt(opts, **kwargs)
         if hasattr(tags[0], 'name'):
             ret.name = tags[0].name
         return ret
 
     def print_summary(self, stream=sys.stdout):
-        print >> stream, "SequenceDB (id %i)" % id(self)
+        print >> stream, self.__class__.__name__ + " (id %i)" % id(self)
         positions = self.__position__.items()
 
         def c(a, b):
@@ -277,6 +302,19 @@ class SequenceDB(DB):
         sio = StringIO()
         self.print_summary(sio)
         return sio.getvalue()
+
+
+class LocalGroupDB(SequenceDB):
+    """This generate a local optimizer of type LocalOptGroup instead
+    of a global optimizer.
+
+    It support the tracks, to only get applied to some Op.
+    """
+    seq_opt = opt.LocalOptGroup
+
+    def __init__(self, failure_callback=opt.SeqOptimizer.warn):
+        super(LocalGroupDB, self).__init__()
+        self.failure_callback = None
 
 
 class ProxyDB(DB):

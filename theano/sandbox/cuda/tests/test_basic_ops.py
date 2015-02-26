@@ -129,6 +129,22 @@ def test_careduce():
                                ((4100,4,3,2),[1]),((4,4100,3,2),[1]),((4,3,4100,2),[1]),((4,3,2,4100),[1]),#0100
                                ((4100,4,3,2),[2]),((4,4100,3,2),[2]),((4,3,4100,2),[2]),((4,3,2,4100),[2]),#0010
                                ((4100,4,3,2),[3]),((4,4100,3,2),[3]),((4,3,4100,2),[3]),((4,3,2,4100),[3]),#0001
+
+                               # reduce over 2d
+                               ((4100,4,3,2),[1,2]),((4,4100,3,2),[1,2]),((4,3,4100,2),[1,2]),((4,3,2,4100),[1,2]),#0110
+#                               ((4100,4,3,2),[0,3]),((4,4100,3,2),[0,3]),((4,3,4100,2),[0,3]),((4,3,2,4100),[0,3]),#1001 need 101
+#                               ((4100,4,3,2),[0,2]),((4,4100,3,2),[0,2]),((4,3,4100,2),[0,2]),((4,3,2,4100),[0,2]),#1010 not implemented
+                               ((4100,4,3,2),[0,1]),((4,4100,3,2),[0,1]),((4,3,4100,2),[0,1]),((4,3,2,4100),[0,1]),#1100
+
+                               # reduce over 3d
+                               # 3d not tested: 1101, 1110, 1111
+#                               ((4100,4,3,2),[0,1,3]),((4,4100,3,2),[0,1,3]),((4,3,4100,2),[0,1,3]),((4,3,2,4100),[0,1,3]),#1101 need 101
+                               ((4100,4,3,2),[0,1,2]),((4,4100,3,2),[0,1,2]),((4,3,4100,2),[0,1,2]),((4,3,2,4100),[0,1,2]),#1110
+
+                               # reduce over 4d
+                               ((4100,4,3,2),[0]),((4,4100,3,2),[0]),((4,3,4100,2),[0]),((4,3,2,4100),[0]),#1111
+
+                               # reduce over 5d
                                ((1100,2,3,4,5),[0,1,2,3,4]),((2,1100,3,4,5),[0,1,2,3,4]),((2,3,1100,4,5),[0,1,2,3,4]),((2,3,4,1100,5),[0,1,2,3,4]),((2,3,4,5,1100),[0,1,2,3,4]),#11111
 
                                ]:
@@ -1077,10 +1093,9 @@ def test_inc_subtensor():
     yval = numpy.asarray([[10, 10, 10], [10, 10, 10], [10, 10, 10]],
                       dtype='float32')
     expr = T.inc_subtensor(x[:, 1:3], y[:, 1:3])
+
     f = theano.function([x, y], expr, mode=mode_with_gpu)
 
-    assert sum([isinstance(node.op, cuda.GpuSubtensor)
-                for node in f.maker.fgraph.toposort()]) == 1
     assert sum([isinstance(node.op, cuda.GpuIncSubtensor) and
                 node.op.set_instead_of_inc==False
                 for node in f.maker.fgraph.toposort()]) == 1
@@ -1098,8 +1113,6 @@ def test_set_subtensor():
                       dtype='float32')
     expr = T.set_subtensor(x[:, 1:3], y[:, 1:3])
     f = theano.function([x, y], expr, mode=mode_with_gpu)
-    assert sum([isinstance(node.op, cuda.GpuSubtensor)
-                for node in f.maker.fgraph.toposort()]) == 1
     assert sum([isinstance(node.op, cuda.GpuIncSubtensor) and
                 node.op.set_instead_of_inc == True
                 for node in f.maker.fgraph.toposort()]) == 1

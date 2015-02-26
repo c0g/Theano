@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import copy
 
 import numpy
 import theano
@@ -17,6 +18,7 @@ import unittest
 from theano.tests import unittest_tools as utt
 from nose.plugins.skip import SkipTest
 from nose.plugins.attrib import attr
+from nose.tools import assert_raises
 
 #TODO: test gpu
 # Done in test_consistency_GPU_{serial,parallel}
@@ -88,7 +90,7 @@ def test_consistency_randomstreams():
     for use_cuda in test_use_cuda:
         #print 'use_cuda =', use_cuda
         samples = []
-        rng = MRG_RandomStreams(seed=seed, use_cuda=False)
+        rng = MRG_RandomStreams(seed=seed, use_cuda=use_cuda)
         for i in range(n_streams):
             stream_samples = []
             u = rng.uniform(size=(n_substreams,), nstreams=n_substreams)
@@ -304,6 +306,31 @@ def test_consistency_GPU_parallel():
 
     samples = numpy.array(samples).flatten()
     assert(numpy.allclose(samples, java_samples))
+
+
+def test_GPU_nstreams_limit():
+    """Verify that a ValueError is raised when n_streams
+    is greater than 2**20 on GPU. This is the value of
+    (NUM_VECTOR_OP_THREADS_PER_BLOCK * NUM_VECTOR_OP_BLOCKS).
+    """
+    if not cuda_available:
+        raise SkipTest('Optional package cuda not available')
+
+    seed = 12345
+    R = MRG_RandomStreams(seed=seed, use_cuda=True)
+
+    def eval_uniform(size, nstreams):
+        if theano.config.mode == "FAST_COMPILE":
+            mode = "FAST_RUN"
+        else:
+            mode = copy.copy(theano.compile.get_default_mode())
+            mode.check_py_code = False
+        out = R.uniform(size=size, nstreams=nstreams, dtype='float32')
+        f = theano.function([], out, mode=mode)
+        return f()
+
+    eval_uniform((10,), 2**20)
+    assert_raises(ValueError, eval_uniform, (10,), 2**20 + 1)
 
 
 def test_consistency_GPUA_serial():

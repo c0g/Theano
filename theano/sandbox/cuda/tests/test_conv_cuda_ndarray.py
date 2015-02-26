@@ -9,6 +9,7 @@ import traceback
 import numpy
 
 from nose.plugins.skip import SkipTest
+from nose.tools import assert_raises
 imported_scipy_convolve2d = False
 try:
     from scipy.signal import convolve2d
@@ -26,15 +27,13 @@ from theano.sandbox import cuda
 if cuda.cuda_available == False:
     raise SkipTest('Optional package cuda disabled')
 
-from theano.sandbox.cuda.dnn import GpuDnnConv, GpuDnnConvBase, dnn_conv
+from theano.sandbox.cuda.dnn import GpuDnnConv, DnnBase, dnn_conv
 
 #needed as the gpu conv don't have a perform implementation.
 if theano.config.mode == 'FAST_COMPILE':
     theano_mode = theano.compile.mode.get_mode('FAST_RUN').including('gpu')
 else:
     theano_mode = theano.compile.mode.get_default_mode().including('gpu')
-
-cuda_tensor4 = cuda.CudaNdarrayType([False] * 4)
 
 device_id = theano.sandbox.cuda.use.device_number
 if device_id is None:
@@ -72,16 +71,21 @@ def py_conv_valid_numpy(img, kern):
                     out[b, k, rr, cc] = innerprod
     return out
 
+def py_conv_pad_img(img, pad_h, pad_w):
+    assert pad_h >= 0 and pad_w >= 0
+    padded_img = numpy.zeros(
+        (img.shape[0], img.shape[1],
+         pad_h * 2 + img.shape[2], pad_w * 2 + img.shape[3]),
+        dtype=img.dtype)
+    padded_img[:, :,
+               pad_h: pad_h + img.shape[2],
+               pad_w: pad_w + img.shape[3]] = img
+    return padded_img
 
 def py_conv_full_numpy(img, kern):
     # manually pad the img with zeros all around, and then run it
     # through py_conv_valid
-    pad_rows = 2 * (kern.shape[2] - 1) + img.shape[2]
-    pad_cols = 2 * (kern.shape[3] - 1) + img.shape[3]
-    padded_img = numpy.zeros((img.shape[0], img.shape[1], pad_rows, pad_cols),
-                             dtype=img.dtype)
-    padded_img[:, :, kern.shape[2] - 1: kern.shape[2] - 1 + img.shape[2],
-                     kern.shape[3] - 1: kern.shape[3] - 1 + img.shape[3]] = img
+    padded_img = py_conv_pad_img(img, kern.shape[2] - 1, kern.shape[3] - 1)
     return py_conv_valid_numpy(padded_img, kern)
 
 
@@ -90,6 +94,12 @@ def py_conv(img, kern, mode, subsample):
     use a scipy or numpy implementation depending is scipy is available.
     The scipy version is faster.
     """
+    if isinstance(mode, int):
+        mode = (mode, mode)
+    if isinstance(mode, tuple):
+        pad_h, pad_w = map(int, mode)
+        img = py_conv_pad_img(img, pad_h, pad_w)
+        mode = 'valid'
     if imported_scipy_convolve2d:
         return py_conv_scipy(img, kern, mode, subsample)
     elif mode == 'valid':
@@ -177,13 +187,17 @@ def _params_allgood(ishape, kshape, mode, subsample=(1, 1), img_stride=(1, 1),
     t0 = time.time()
     cpuval = py_conv(npy_img, npy_kern, mode, subsample)
     t1 = time.time()
-    i = cuda_tensor4()
-    k = cuda_tensor4()
+    i = cuda.CudaNdarrayType(
+        broadcastable=[sh == 1 for sh in npy_img.shape])()
+    k = cuda.CudaNdarrayType(
+        broadcastable=[sh == 1 for sh in npy_kern.shape])()
     op = theano.sandbox.cuda.blas.GpuConv(border_mode=mode,
                                           subsample=subsample,
                                           version=version,
                                           verbose=verbose,
                                           kshp=compile_kshp)(i, k)
+    assert [(sh == 1) is br for
+            sh, br in zip(cpuval.shape[:2], op.type.broadcastable[:2])]
     f = theano.function([i, k], op, mode=theano_mode)
     if cls is not None:
         assert any([isinstance(node.op, cls)
@@ -351,198 +365,6 @@ def get_valid_shapes():
     return shapes
 
 
-def test_valid_0_2():
-    seed_rng()
-    shapes = get_valid_shapes()
-    version = [0, 2]
-    verbose = 0
-
-    random = True
-    print_ = False
-    ones = False
-    if ones:
-        random = False
-    shapes2 = []
-
-    for id, (ishape, kshape, subshape, istride, kstride) in enumerate(shapes):
-        oshape = [ishape[0]] + [kshape[0]] + list(numpy.asarray(ishape[2:]) -
-                                                  numpy.asarray(kshape[2:]) +
-                                                  numpy.asarray([1, 1]))
-        if oshape[3] > device_prop['maxThreadsDim0']:
-            continue
-        if ishape[1] > 1:
-            continue
-        if ((numpy.prod(ishape[2:]) + numpy.prod(kshape[2:])) * 4 >
-            (16 * 1024 - 150)):
-            continue
-        if subshape == (1, 1):
-            shapes2.append((ishape, kshape, subshape, istride, kstride))
-    shapes = shapes2
-
-    for t in exec_conv(version, shapes, verbose, random, 'valid',
-                       print_=print_, ones=ones, rtol=1.1e-5):
-        yield t
-
-
-def test_valid_1_3_11_12():
-    seed_rng()
-    shapes = get_valid_shapes()
-    version = [1, 3, 11, 12]
-    verbose = 0
-
-    random = True
-    print_ = False
-    ones = False
-    if ones:
-        random = False
-    shapes2 = []
-
-    for id, (ishape, kshape, subshape, istride, kstride) in enumerate(shapes):
-        oshape = [ishape[0]] + [kshape[0]] + list(numpy.asarray(ishape[2:]) -
-                                                  numpy.asarray(kshape[2:]) +
-                                                  numpy.asarray([1, 1]))
-        if oshape[3] > device_prop['maxThreadsDim0']:
-            continue
-        if ((numpy.prod(ishape[2:]) + numpy.prod(kshape[2:])) * 4 >
-            (16 * 1024 - 150)):
-            continue
-        if subshape == (1, 1):
-            shapes2.append((ishape, kshape, subshape, istride, kstride))
-    shapes = shapes2
-
-    for t in exec_conv(version, shapes, verbose, random, 'valid',
-                       print_=print_, ones=ones, rtol=1.1e-5):
-        yield t
-
-
-def test_valid_4():
-    seed_rng()
-    shapes = get_valid_shapes()
-    version = [4]
-    verbose = 0
-
-    random = True
-    print_ = False
-    ones = False
-    if ones:
-        random = False
-    shapes2 = []
-
-    for id, (ishape, kshape, subshape, istride, kstride) in enumerate(shapes):
-        oshape = [ishape[0]] + [kshape[0]] + list(numpy.asarray(ishape[2:]) -
-                                                  numpy.asarray(kshape[2:]) +
-                                                  numpy.asarray([1, 1]))
-        if oshape[3] > device_prop['maxThreadsDim0']:
-            continue
-        if ishape[1] > 1:
-            continue
-        if ((kshape[2] * ishape[3] * 4 + numpy.prod(kshape[2:]) * 4) >
-            (16 * 1024 - 150)):
-            continue
-        if subshape == (1, 1):
-            shapes2.append((ishape, kshape, subshape, istride, kstride))
-    shapes = shapes2
-
-    for t in exec_conv(version, shapes, verbose, random, 'valid',
-                       print_=print_, ones=ones, rtol=1.1e-5):
-        yield t
-
-
-def test_valid_5():
-    seed_rng()
-    shapes = get_valid_shapes()
-    version = [5]
-    verbose = 0
-
-    random = True
-    print_ = False
-    ones = False
-    if ones:
-        random = False
-    shapes2 = []
-
-    for id, (ishape, kshape, subshape, istride, kstride) in enumerate(shapes):
-        oshape = [ishape[0]] + [kshape[0]] + list(numpy.asarray(ishape[2:]) -
-                                                  numpy.asarray(kshape[2:]) +
-                                                  numpy.asarray([1, 1]))
-        if oshape[3] > device_prop['maxThreadsDim0']:
-            continue
-        if ((kshape[2] * ishape[3] * 4 + numpy.prod(kshape[2:]) * 4) >
-            (16 * 1024 - 150)):
-            continue
-        if subshape == (1, 1):
-            shapes2.append((ishape, kshape, subshape, istride, kstride))
-    shapes = shapes2
-
-    for t in exec_conv(version, shapes, verbose, random, 'valid',
-                       print_=print_, ones=ones, rtol=1.1e-5):
-        yield t
-
-
-def test_valid_7_8_13():
-    seed_rng()
-    shapes = get_valid_shapes()
-    # This is to test the "new" lower shared memory usage.
-    shapes.append(((10, 30, 60, 60), (20, 30, 40, 40),
-                   (1, 1), (1, 1), (1, 1)))
-    version = [7, 8, 13]
-    verbose = 0
-
-    random = True
-    print_ = False
-    ones = False
-    if ones:
-        random = False
-    shapes2 = []
-
-    for id, (ishape, kshape, subshape, istride, kstride) in enumerate(shapes):
-        oshape = [ishape[0]] + [kshape[0]] + list(numpy.asarray(ishape[2:]) -
-                                                  numpy.asarray(kshape[2:]) +
-                                                  numpy.asarray([1, 1]))
-        if oshape[2] * oshape[3] > device_prop['maxThreadsDim0']:
-            continue
-        if max(numpy.prod(ishape[2:]) * 4 + 2 * kshape[3] * 4,
-               oshape[2] * oshape[3] * 4 * 2) > (16 * 1024 - 150):
-            continue
-        if subshape == (1, 1):
-            shapes2.append((ishape, kshape, subshape, istride, kstride))
-    shapes = shapes2
-
-    for t in exec_conv(version, shapes, verbose, random, 'valid',
-                       print_=print_, ones=ones, rtol=1.1e-5):
-        yield t
-
-
-def test_valid_9_10():
-    seed_rng()
-    shapes = get_valid_shapes()
-    version = [9, 10]
-    verbose = 0
-
-    random = True
-    print_ = False
-    ones = False
-    if ones:
-        random = False
-    shapes2 = []
-
-    for id, (ishape, kshape, subshape, istride, kstride) in enumerate(shapes):
-        oshape = [ishape[0]] + [kshape[0]] + list(numpy.asarray(ishape[2:]) -
-                                                  numpy.asarray(kshape[2:]) +
-                                                  numpy.asarray([1, 1]))
-        if oshape[3] > device_prop['maxThreadsDim0']:
-            continue
-        if (kshape[3] * 4 + ishape[3]) > (16 * 1024 - 150):
-            continue
-        if subshape == (1, 1):
-            shapes2.append((ishape, kshape, subshape, istride, kstride))
-    shapes = shapes2
-
-    for t in exec_conv(version, shapes, verbose, random, 'valid',
-                       print_=print_, ones=ones, rtol=1.1e-5):
-        yield t
-
-
 def _test_valid(cls, mode=None, extra_shapes=[], version=[-1]):
     seed_rng()
     shapes = get_valid_shapes()
@@ -565,7 +387,7 @@ def _test_valid(cls, mode=None, extra_shapes=[], version=[-1]):
 def test_valid():
     for t in _test_valid(None,
                          mode=theano_mode,
-                         version=[-2, -1, 6]):
+                         version=[-1]):
         yield t
 
 
@@ -574,7 +396,7 @@ def test_gemm_valid():
     extra_shapes += get_shapes2(scales_kern=(2, 2), kern_stride=(2, 2))
 
     for t in _test_valid(cuda.blas.BaseGpuCorrMM,
-                         mode=theano_mode.including("conv_gemm"),
+                         mode=theano_mode.excluding("cudnn"),
                          extra_shapes=extra_shapes):
         yield t
 
@@ -582,8 +404,39 @@ def test_gemm_valid():
 def test_dnn_valid():
     if not cuda.dnn.dnn_available():
         raise SkipTest(cuda.dnn.dnn_available.msg)
-    for t in _test_valid(GpuDnnConv, mode=theano_mode.including("cudnn")):
+    for t in _test_valid(DnnBase, mode=theano_mode.including("cudnn")):
         yield t
+
+
+def test_default_conv():
+    """Just test that we introduce the right GPU convolution
+    version.
+
+    """
+    img = theano.tensor.ftensor4()
+    fil = theano.tensor.ftensor4()
+
+    c = theano.tensor.nnet.conv2d(img, fil)
+    f = theano.function([img, fil], c, mode=theano_mode)
+
+    if cuda.dnn.dnn_available():
+        assert any([isinstance(a.op, GpuDnnConv)
+                    for a in f.maker.fgraph.apply_nodes])
+    else:
+        assert any([isinstance(a.op, cuda.blas.GpuCorrMM)
+                    for a in f.maker.fgraph.apply_nodes])
+
+    mode = theano_mode.excluding('local_conv_dnn', 'local_conv_gemm')
+    f = theano.function([img, fil], c, mode=mode)
+
+    assert any([isinstance(a.op, cuda.blas.GpuConv)
+                for a in f.maker.fgraph.apply_nodes])
+
+    mode = theano_mode.excluding('conv_dnn', 'conv_gemm')
+    f = theano.function([img, fil], c, mode=mode)
+
+    assert any([isinstance(a.op, cuda.blas.GpuConv)
+                for a in f.maker.fgraph.apply_nodes])
 
 
 def _test_full(cls, mode=None, version=[-1], extra_shapes=[]):
@@ -652,20 +505,20 @@ def _test_full(cls, mode=None, version=[-1], extra_shapes=[]):
 def test_full():
     for t in _test_full(None,
                         mode=theano_mode,
-                        version=[-2, -1, 0, 1, 2, 3, 4, 5]):
+                        version=[-1]):
         yield t
 
 
 def test_gemm_full():
     for t in _test_full(cuda.blas.BaseGpuCorrMM,
-                        mode=theano_mode.including("conv_gemm")):
+                        mode=theano_mode.excluding("cudnn")):
         yield t
 
 
 def test_dnn_full():
     if not cuda.dnn.dnn_available():
         raise SkipTest(cuda.dnn.dnn_available.msg)
-    for t in _test_full(GpuDnnConv, mode=theano_mode.including("cudnn")):
+    for t in _test_full(DnnBase, mode=theano_mode.including("cudnn")):
         yield t
 
 
@@ -703,25 +556,29 @@ def _test_subsample(cls, mode, version_valid=[-1], version_full=[-1]):
 
 def test_subsample():
     for t in _test_subsample(None, theano_mode,
-                             version_valid=[-2, -1, 1, 3, 11, 12],
-                             version_full=[-2, -1]):
+                             version_valid=[-1],
+                             version_full=[-1]):
         yield t
 
 
 def test_gemm_subsample():
     for t in _test_subsample(cuda.blas.BaseGpuCorrMM,
-                             theano_mode.including("conv_gemm")):
+                             theano_mode.excluding("cudnn")):
         yield t
 
 
 def test_dnn_subsample():
     if not cuda.dnn.dnn_available():
         raise SkipTest(cuda.dnn.dnn_available.msg)
-    for t in _test_subsample(GpuDnnConv, theano_mode.including('cudnn')):
+    for t in _test_subsample(DnnBase, theano_mode.including('cudnn')):
         yield t
 
 
 class TestConv2DGPU(unittest.TestCase):
+    conv_ops = (cuda.blas.GpuConv,
+                cuda.dnn.DnnBase,
+                cuda.blas.BaseGpuCorrMM)
+
     def test_logical_shapes(self):
         seed_rng()
         for stride in range(1, 4):
@@ -748,7 +605,7 @@ class TestConv2DGPU(unittest.TestCase):
 
             func = theano.function([a, A], image_estimate, mode=theano_mode)
             #theano.printing.debugprint(func,)
-            assert any([isinstance(node.op, theano.sandbox.cuda.blas.GpuConv)
+            assert any([isinstance(node.op, self.conv_ops)
                         for node in func.maker.fgraph.toposort()])
 
             a_in = numpy.random.randn(*featshp).astype("float32")
@@ -791,6 +648,63 @@ class TestConv2DGPU(unittest.TestCase):
         finally:
             theano_mode = theano_mode_orig
 
+class TestConvWithPadding(object):
+    """test conv ops that support arbitrary padding via border_mode
+    note that in order to make the yield work, we can not subclass from 
+    unittest.TestCase
+    """
+
+    @staticmethod
+    def gemm_conv_op(img, kern, border_mode):
+        kern = theano.sandbox.cuda.basic_ops.gpu_contiguous(
+            kern[:, :, ::-1, ::-1])
+        y = theano.sandbox.cuda.blas.GpuCorrMM(border_mode=border_mode)(
+            img, kern)
+        return y
+
+    conv_ops = []
+
+    @classmethod
+    def setup_class(cls):
+        cls.conv_ops.append(cls.gemm_conv_op)
+        if cuda.dnn.dnn_available():
+            cls.conv_ops.append(cuda.dnn.dnn_conv)
+
+    def test_invalid_arg(self):
+        img = theano._asarray(numpy.empty((1, 1, 1, 1)), dtype='float32')
+        kern = theano._asarray(numpy.empty((1, 1, 1, 1)), dtype='float32')
+        for i in self.conv_ops:
+            assert_raises(ValueError, i, img, kern,
+                              border_mode=(-1, 0))
+            assert_raises(ValueError, i, img, kern,
+                              border_mode=(0, -1))
+            assert_raises(ValueError, i, img, kern,
+                              border_mode='not border')
+
+    def _run_onecase(self, img_shape, kern_shape, padding, op):
+        npy_img = numpy.random.rand(*img_shape).astype('float32')
+        npy_kern = numpy.random.rand(*kern_shape).astype('float32')
+        img = theano._asarray(npy_img, dtype='float32')
+        kern = theano.shared(npy_kern)
+        border_mode = padding
+        cpuval = py_conv(npy_img, npy_kern, border_mode, (1, 1))
+        X = tensor.ftensor4()
+        Y = op(X, kern, border_mode=border_mode)
+        func = theano.function([X], Y, mode=theano_mode)
+        gpuval = numpy.asarray(func(img))
+        assert_allclose(cpuval, gpuval, rtol=1e-5, atol=1e-5)
+
+    def test_numeric_value(self):
+        params = [
+            ((5, 10, 4, 4), (12, 10, 4, 4), (2, 1)),
+            ((5, 10, 8, 8), (12, 10, 4, 4), 3),
+            ((5, 10, 6, 8), (12, 10, 3, 4), 'full'),
+            ((5, 10, 9, 6), (12, 10, 9, 4), 'valid')
+        ]
+        for img_shape, kern_shape, padding in params:
+            for op in self.conv_ops:
+                yield self._run_onecase, img_shape, kern_shape, padding, op
+
 
 def gemm_directly(bs, ch, nf, rImg1, rImg2, rFlt1, rFlt2, subsx, subsy,
                   direction):
@@ -801,22 +715,37 @@ def gemm_directly(bs, ch, nf, rImg1, rImg2, rFlt1, rFlt2, subsx, subsy,
     npy_img = theano._asarray(numpy.random.rand(*ishape), dtype='float32')
     npy_kern = theano._asarray(numpy.random.rand(*kshape), dtype='float32')
 
-    i = cuda_tensor4()
-    k = cuda_tensor4()
-
     if direction == 'fprop':
+        i = cuda.CudaNdarrayType(
+            broadcastable=[sh == 1 for sh in npy_img.shape])()
+        k = cuda.CudaNdarrayType(
+            broadcastable=[sh == 1 for sh in npy_kern.shape])()
+
         cpuval = py_conv(npy_img, npy_kern, 'valid', subsample)
         op = theano.sandbox.cuda.blas.GpuCorrMM(border_mode='valid',
                                                 subsample=subsample)(i, k)
         f = theano.function([i, k], op, mode=theano_mode)
         gpuval = f(npy_img, npy_kern[:,:,::-1,::-1])
     elif direction == 'bprop img':
+        i = cuda.CudaNdarrayType(
+            broadcastable=[sh == 1 for sh in
+                           npy_kern.transpose(1, 0, 2, 3).shape])()
+        k = cuda.CudaNdarrayType(
+            broadcastable=[sh == 1 for sh in npy_img.shape])()
+
         cpuval = py_conv(npy_img, npy_kern, 'full', subsample)
         op = theano.sandbox.cuda.blas.GpuCorrMM_gradInputs(
             border_mode='valid', subsample=subsample)(i, k)
         f = theano.function([i, k], op, mode=theano_mode)
         gpuval = f(npy_kern.transpose(1, 0, 2, 3), npy_img)
     elif direction == 'bprop kern':
+        i = cuda.CudaNdarrayType(
+            broadcastable=[sh == 1 for sh in
+                           npy_img.transpose(1, 0, 2, 3).shape])()
+        k = cuda.CudaNdarrayType(
+            broadcastable=[sh == 1 for sh in
+                           npy_kern.transpose(1, 0, 2, 3).shape])()
+
         cpuval = py_conv(npy_img, npy_kern, 'valid', subsample)
         op = theano.sandbox.cuda.blas.GpuCorrMM_gradWeights(
             border_mode='valid', subsample=subsample)(i, k)
@@ -850,8 +779,7 @@ def test_gemm_directly():
 
 
 def gemm_op(mode, subsample):
-    pad = 'full' if mode == 'full' else (0, 0)
-    return theano.sandbox.cuda.blas.GpuCorrMM('valid', subsample, pad)
+    return theano.sandbox.cuda.blas.GpuCorrMM(mode, subsample)
 
 
 def dnn_op(mode, subsample):
@@ -868,8 +796,10 @@ def conv_grad(mode, bs, ch, nf, rImg1, rImg2, rFlt1, rFlt2, subsample, op):
     npy_img = theano._asarray(numpy.random.rand(*ishape), dtype='float32')
     npy_kern = theano._asarray(numpy.random.rand(*kshape), dtype='float32')
 
-    i = cuda_tensor4()
-    k = cuda_tensor4()
+    i = cuda.CudaNdarrayType(
+        broadcastable=[sh == 1 for sh in npy_img.shape])()
+    k = cuda.CudaNdarrayType(
+        broadcastable=[sh == 1 for sh in npy_kern.shape])()
 
     # TODO: also test custom pad values
     corr_op = op(mode, subsample)(i, k)
@@ -902,13 +832,16 @@ def conv_grad(mode, bs, ch, nf, rImg1, rImg2, rFlt1, rFlt2, subsample, op):
         # skip if the reference implementation can't do it
         pass
 
-    f = theano.function([i, k], outputs, mode=theano_mode)
+    f = theano.function([i, k], outputs, mode=theano_mode.excluding('conv_dnn', 'conv_gemm'))
 
     allvals = f(npy_img, npy_kern)
 
-    for a, b, p in zip(allvals[::2], allvals[1::2],
-                       ('top', 'dtop/dbottom', 'dtop/dweight',
-                        'dtop/dbottom/dweight', 'dtop/dweight/dbottom')):
+    for a, b, oa, ob, p in zip(allvals[::2], allvals[1::2],
+                               outputs[::2], outputs[1::2],
+                               ('top', 'dtop/dbottom', 'dtop/dweight',
+                                'dtop/dbottom/dweight', 'dtop/dweight/dbottom')):
+        assert oa.type.broadcastable[:2] == ob.type.broadcastable[:2]
+
         assert_allclose(a, b, rtol=1e-4)
 
 

@@ -1,6 +1,7 @@
 import sys
 import time
 
+import theano
 from theano import config
 from theano.gof.python25 import partial
 from theano.gof.python25 import OrderedDict
@@ -104,7 +105,32 @@ class Bookkeeper(Feature):
             self.on_prune(fgraph, node, 'Bookkeeper.detach')
 
 
+class GetCheckpoint:
+
+    def __init__(self, history, fgraph):
+        self.h = history
+        self.fgraph = fgraph
+
+    def __call__(self):
+        return len(self.h.history[self.fgraph])
+
+
+class LambdExtract:
+
+    def __init__(self, fgraph, node, i, r, reason=None):
+        self.fgraph = fgraph
+        self.node = node
+        self.i = i
+        self.r = r
+        self.reason = reason
+
+    def __call__(self):
+        return self.fgraph.change_input(self.node, self.i, self.r,
+                                    reason=("Revert", self.reason))
+
+
 class History(Feature):
+    pickle_rm_attr = ["checkpoint", "revert"]
 
     def __init__(self):
         self.history = {}
@@ -114,7 +140,14 @@ class History(Feature):
             raise AlreadyThere("History feature is already present or in"
                                " conflict with another plugin.")
         self.history[fgraph] = []
-        fgraph.checkpoint = lambda: len(self.history[fgraph])
+        # Don't call unpickle here, as ReplaceValidate.on_attach()
+        # call to History.on_attach() will call the
+        # ReplaceValidate.unpickle and not History.unpickle
+        fgraph.checkpoint = GetCheckpoint(self, fgraph)
+        fgraph.revert = partial(self.revert, fgraph)
+
+    def unpickle(self, fgraph):
+        fgraph.checkpoint = GetCheckpoint(self, fgraph)
         fgraph.revert = partial(self.revert, fgraph)
 
     def on_detach(self, fgraph):
@@ -126,8 +159,7 @@ class History(Feature):
         if self.history[fgraph] is None:
             return
         h = self.history[fgraph]
-        h.append(lambda: fgraph.change_input(node, i, r,
-                                          reason=("Revert", reason)))
+        h.append(LambdExtract(fgraph, node, i, r, reason))
 
     def revert(self, fgraph, checkpoint):
         """
@@ -144,47 +176,66 @@ class History(Feature):
 
 
 class Validator(Feature):
+    pickle_rm_attr = ["validate", "consistent"]
 
     def on_attach(self, fgraph):
         for attr in ('validate', 'validate_time'):
             if hasattr(fgraph, attr):
                 raise AlreadyThere("Validator feature is already present or in"
                                    " conflict with another plugin.")
+        # Don't call unpickle here, as ReplaceValidate.on_attach()
+        # call to History.on_attach() will call the
+        # ReplaceValidate.unpickle and not History.unpickle
+        fgraph.validate = partial(self.validate_, fgraph)
+        fgraph.consistent = partial(self.consistent_, fgraph)
 
-        def validate():
-            t0 = time.time()
-            ret = fgraph.execute_callbacks('validate')
-            t1 = time.time()
-            if fgraph.profile:
-                fgraph.profile.validate_time += t1 - t0
-            return ret
-
-        fgraph.validate = validate
-
-        def consistent():
-            try:
-                fgraph.validate()
-                return True
-            except Exception:
-                return False
-        fgraph.consistent = consistent
+    def unpickle(self, fgraph):
+        fgraph.validate = partial(self.validate_, fgraph)
+        fgraph.consistent = partial(self.consistent_, fgraph)
 
     def on_detach(self, fgraph):
         del fgraph.validate
         del fgraph.consistent
 
+    def validate_(self, fgraph):
+        t0 = time.time()
+        ret = fgraph.execute_callbacks('validate')
+        t1 = time.time()
+        if fgraph.profile:
+            fgraph.profile.validate_time += t1 - t0
+        return ret
+
+    def consistent_(self, fgraph):
+        try:
+            fgraph.validate()
+            return True
+        except Exception:
+            return False
+
 
 class ReplaceValidate(History, Validator):
+    pickle_rm_attr = ["replace_validate", "replace_all_validate",
+                      "replace_all_validate_remove"] + \
+                      History.pickle_rm_attr + Validator.pickle_rm_attr
+        
+    
 
     def on_attach(self, fgraph):
-        History.on_attach(self, fgraph)
-        Validator.on_attach(self, fgraph)
-        for attr in ('replace_validate', 'replace_all_validate'):
+        for attr in ('replace_validate', 'replace_all_validate',
+                     'replace_all_validate_remove'):
             if hasattr(fgraph, attr):
                 raise AlreadyThere("ReplaceValidate feature is already present"
                                    " or in conflict with another plugin.")
+        History.on_attach(self, fgraph)
+        Validator.on_attach(self, fgraph)
+        self.unpickle(fgraph)
+
+    def unpickle(self, fgraph):
+        History.unpickle(self, fgraph)
+        Validator.unpickle(self, fgraph)
         fgraph.replace_validate = partial(self.replace_validate, fgraph)
-        fgraph.replace_all_validate = partial(self.replace_all_validate, fgraph)
+        fgraph.replace_all_validate = partial(self.replace_all_validate,
+                                              fgraph)
         fgraph.replace_all_validate_remove = partial(
             self.replace_all_validate_remove, fgraph)
 
@@ -246,6 +297,12 @@ class ReplaceValidate(History, Validator):
                         " mailing list theano-users so that we can fix it.")
                     print >> out, reason, replacements
                 raise ReplacementDidntRemovedError()
+
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        if "history" in d:
+            del d["history"]
+        return d
 
 
 class NodeFinder(Bookkeeper):
@@ -338,3 +395,26 @@ class PreserveNames(Feature):
             new_r.name = r.name
 
 
+class NoOutputFromInplace(Feature):
+
+    def validate(self, fgraph):
+        if not hasattr(fgraph, 'destroyers'):
+            return True
+        for out in list(fgraph.outputs):
+
+            if out.owner is None:
+                continue
+
+            # Validate that the node that produces the output does not produce
+            # it by modifying something else inplace.
+            node = out.owner
+            op = node.op
+            out_idx = node.outputs.index(out)
+            if hasattr(op, 'destroy_map') and out_idx in op.destroy_map.keys():
+                raise theano.gof.InconsistencyError(
+                    "A function graph Feature has requested (probably for ",
+                    "efficiency reasons for scan) that outputs of the graph",
+                    "be prevented from being the result of inplace ",
+                    "operations. This has prevented output ", out, " from ",
+                    "being computed by modifying another variable ",
+                    "inplace.")

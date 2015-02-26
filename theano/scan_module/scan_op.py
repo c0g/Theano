@@ -22,17 +22,12 @@ import numpy
 import theano
 from theano.compat import exc_message
 from theano.compile import function, Param, Out
-from theano import compile
-from theano import gradient
-from theano.gof.python25 import any, OrderedDict
+from theano import compile, config, gradient, gof, tensor
 from theano.gof import PureOp, Apply
-from theano import gof
+from theano.gof.python25 import any, OrderedDict
 from theano.tensor import TensorType
-from theano import tensor
 from theano.tensor.opt import Shape_i
-from theano.gradient import grad_undefined
-from theano.gradient import DisconnectedType
-from theano.gradient import NullType
+from theano.gradient import grad_undefined, DisconnectedType, NullType
 from theano.compile.profiling import ScanProfileStats
 
 from theano.scan_module import scan_utils
@@ -42,12 +37,18 @@ from theano.scan_module.scan_utils import safe_new, forced_replace
 _logger = logging.getLogger('theano.scan_module.scan_op')
 
 
+from theano.configparser import AddConfigVar, BoolParam
+
+AddConfigVar('scan.allow_gc',
+             "Allow/disallow gc inside of Scan (default: False)",
+             BoolParam(False))
+
+
 class Scan(PureOp):
     def __init__(self,
                  inputs,
                  outputs,
                  info,
-                 typeConstructor=None,
                 ):
         """
         :param inputs: inputs of the inner function of scan
@@ -56,21 +57,6 @@ class Scan(PureOp):
             the scan op (like number of different types of
             arguments, name, mode, if it should run on GPU or
             not, etc.)
-        :param typeConstructor: function that constructs an equivalent
-            to Theano TensorType
-
-
-        Note: ``typeConstructor`` had been added to refactor how
-        Theano deals with the GPU. If it runs on the GPU, scan needs
-        to construct certain outputs (those who reside in the GPU
-        memory) as the GPU-specific type.  However we can not import
-        gpu code in this file (as it is in sandbox, and not available
-        on each machine) so the workaround is that the GPU
-        optimization passes to the constructor of this class a
-        function that is able to construct a GPU type. This way the
-        class Scan does not need to be aware of the details for the
-        GPU, it just constructs any tensor using this function (which
-        by default constructs normal tensors).
         """
         if 'gpua' not in info:
             info['gpua'] = False
@@ -82,24 +68,17 @@ class Scan(PureOp):
         # since info contains all tunable parameters of the op, so for two
         # scan to be equal this tunable parameters should be the same
         self.info = info
-
         # build a list of output types for any Apply node using this op.
         self.output_types = []
         idx = 0
         jdx = 0
-        tensorConstructor = lambda broadcastable, dtype: TensorType(
-            broadcastable=broadcastable, dtype=dtype)
-        if typeConstructor is None:
-            typeConstructor = tensorConstructor
 
         while idx < self.n_mit_mot_outs:
             # Not that for mit_mot there are several output slices per
             # output sequence
             o = outputs[idx]
             self.output_types.append(
-                typeConstructor(
-                    broadcastable=(False,) + o.type.broadcastable,
-                    dtype=o.type.dtype))
+                o.type.clone(broadcastable=(False,) + o.type.broadcastable))
 
             idx += len(self.mit_mot_out_slices[jdx])
             jdx += 1
@@ -109,9 +88,7 @@ class Scan(PureOp):
 
         for o in outputs[idx:end]:
             self.output_types.append(
-                typeConstructor(
-                    broadcastable=(False,) + o.type.broadcastable,
-                    dtype=o.type.dtype))
+                o.type.clone(broadcastable=(False,) + o.type.broadcastable))
 
         # shared outputs + possibly the ending condition
         for o in outputs[end:]:
@@ -128,7 +105,7 @@ class Scan(PureOp):
             isinstance(mode_instance, compile.profilemode.ProfileMode)):
             mode_instance = compile.profilemode.ProfileMode(
                 optimizer=mode_instance.provided_optimizer,
-                linker=mode_instance.provided_linker)
+                linker=mode_instance.linker.clone(allow_gc=self.allow_gc))
             compile.profilemode.prof_mode_instance_to_print.append(
                                                     mode_instance)
             self.mode_instance = mode_instance
@@ -137,7 +114,9 @@ class Scan(PureOp):
             else:
                 self.mode_instance.message = "Scan sub profile"
         else:
-            self.mode_instance = mode_instance
+            self.mode_instance = type(mode_instance)(
+                optimizer=mode_instance.provided_optimizer,
+                linker=mode_instance.linker.clone(allow_gc=self.allow_gc))
 
         if not hasattr(self, 'name') or self.name is None:
             self.name = 'scan_fn'
@@ -166,6 +145,12 @@ class Scan(PureOp):
             local_fgraph = gof.FunctionGraph(tmp_in, tmp_out, clone=False)
             self._cmodule_key = gof.CLinker().cmodule_key_(local_fgraph, [])
             self._hash_inner_graph = hash(self._cmodule_key)
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+        if "allow_gc" not in self.__dict__:
+            self.allow_gc = True
+            self.info['allow_gc'] = True
 
     def make_node(self, *inputs):
         """
@@ -232,10 +217,9 @@ class Scan(PureOp):
             if rval.ndim == as_var.ndim:
                 rval = as_var.type.filter_variable(rval)
             else:
-                tmp = as_var.type.__class__(
-                    broadcastable=tuple(var.broadcastable[:1])+\
-                                  tuple(as_var.broadcastable),
-                    dtype=as_var.dtype)
+                tmp = as_var.type.clone(
+                    broadcastable=(tuple(var.broadcastable[:1]) +
+                                   tuple(as_var.broadcastable)))
                 rval = tmp.filter_variable(rval)
             return rval
 
@@ -451,10 +435,10 @@ class Scan(PureOp):
         if not 'destroy_map' in other.info:
             other.info['destroy_map'] = OrderedDict()
         keys_to_check = ['truncate_gradient', 'profile',
-                         'n_seqs', 'tap_array', 'name',
+                         'n_seqs', 'tap_array',
                          'as_while', 'n_mit_sot', 'destroy_map',
                          'n_nit_sot', 'n_shared_outs',
-                         'n_sit_sot', 'gpu', 'n_mit_mot_outs',
+                         'n_sit_sot', 'gpu', 'gpua', 'n_mit_mot_outs',
                          'n_mit_mot', 'mit_mot_out_slices']
         # This are some safety checks ( namely that the inner graph has the
         # same number of inputs and same number of outputs )
@@ -472,15 +456,11 @@ class Scan(PureOp):
             if self_in.type != other_in.type:
                 return False
 
-        if not scan_utils.equal_computations(self.outputs,
+        return scan_utils.equal_computations(self.outputs,
                                              other.outputs,
                                              self.inputs,
-                                             other.inputs):
-            return False
+                                             other.inputs)
 
-        # If they do, then they need to match in other small details
-        # like name, mode, etc.
-        return True
 
     def __str__(self):
         if self.gpu:
@@ -512,11 +492,11 @@ class Scan(PureOp):
         return aux_txt
 
     def __hash__(self):
-        return (hash(type(self)) ^
-                # and a hash representing the inner graph using the
-                # CLinker.cmodule_key_
-                self._hash_inner_graph ^
-                scan_utils.hash_listsDictsTuples(self.info))
+        return hash((type(self),
+                     # and a hash representing the inner graph using the
+                     # CLinker.cmodule_key_
+                     self._hash_inner_graph,
+                     scan_utils.hash_listsDictsTuples(self.info)))
 
     def make_thunk(self, node, storage_map, compute_map, no_recycling):
         """
@@ -555,7 +535,7 @@ class Scan(PureOp):
                   self.n_sit_sot +
                   self.n_nit_sot)
         wrapped_inputs = [Param(x, borrow=True) for x in self.inputs]
-        wrapped_outputs = [Out(x, borrow=False) for x in
+        wrapped_outputs = [Out(x, borrow=(x not in self.inputs)) for x in
                            self.outputs[:slices]]
         wrapped_outputs += self.outputs[slices:]
         profile = None
@@ -648,10 +628,17 @@ class Scan(PureOp):
             p = self.execute
         # default arguments are stored in the closure of `rval`
 
-        def rval(p=p, i=node_input_storage, o=node_output_storage, n=node):
+        # Big ugly hack since we can't get the real value of allow_gc
+        # for the englobing function.
+        allow_gc = config.allow_gc and not self.allow_gc
+
+        def rval(p=p, i=node_input_storage, o=node_output_storage, n=node,
+                 allow_gc=allow_gc):
             r = p(n, [x[0] for x in i], o)
             for o in node.outputs:
                 compute_map[o][0] = True
+            if allow_gc:
+                self.fn.free()
             return r
         rval.inputs = node_input_storage
         rval.outputs = node_output_storage
@@ -940,11 +927,14 @@ class Scan(PureOp):
                     offset += 1
 
             # 4. collecting slices where the output should be stored
+
+            # 4.1. Collect slices for mitmots
             for idx in xrange(self.n_mit_mot_outs):
                 output_storage[idx].storage[0] = None
 
+            # 4.2. Collect slices for mitsots, sitsots and nitsots
             offset = self.n_mit_mot_outs
-            if i != 0 and self.n_nit_sot > 0:
+            if i != 0:
                 for idx in xrange(self.n_outs + self.n_nit_sot -
                                   self.n_mit_mot):
                     if (store_steps[idx + self.n_mit_mot] == 1 or
@@ -959,15 +949,24 @@ class Scan(PureOp):
                                   self.n_mit_mot):
                     output_storage[idx + offset].storage[0] = None
 
+            # 4.3. Collect slices for shared outputs
             offset += self.n_outs + self.n_nit_sot - self.n_mit_mot
             for idx in xrange(self.n_shared_outs):
                 output_storage[idx + offset].storage[0] = None
-            # If condition add it to the mix
+
+            # 4.4. If there is a condition add it to the mix
             if self.as_while:
                 pdx = offset + self.n_shared_outs
                 output_storage[pdx].storage[0] = None
+
+            # 4.5. Keep a reference to the variables currently in the
+            # output_storage to be able to compare them with the actual
+            # outputs of the inner function after its execution
+            old_output_storage = [o.storage[0] for o in output_storage]
+
             # 5. compute outputs
             t0_fn = time.time()
+
             try:
                 fn()
             except Exception:
@@ -977,8 +976,8 @@ class Scan(PureOp):
                     # done by raise_with_op is not implemented in C.
                     if hasattr(self.fn, 'thunks'):
                         # For the CVM
-                        gof.vm.raise_with_op(self.fn.nodes[self.fn.position_of_error],
-                                             self.fn.thunks[self.fn.position_of_error])
+                        gof.link.raise_with_op(self.fn.nodes[self.fn.position_of_error],
+                                               self.fn.thunks[self.fn.position_of_error])
                     else:
                         # For the c linker
                         # We don't have access from python to all the temps values
@@ -987,10 +986,17 @@ class Scan(PureOp):
                 else:
                     # old-style linkers raise their own exceptions
                     raise
+
             dt_fn = time.time() - t0_fn
             if self.as_while:
                 pdx = offset + self.n_shared_outs
                 cond = output_storage[pdx].storage[0] == 0
+
+            # Check which of the pre-allocated outputs (if applicable) have
+            # been reused by the inner function
+            output_reused = [old_output_storage[o] is
+                             output_storage[o].storage[0]
+                             for o in range(len(output_storage))]
 
             t_fn += dt_fn
             offset_out = 0
@@ -1008,8 +1014,7 @@ class Scan(PureOp):
 
             for j in xrange(begin, end):
                 if (store_steps[j] == 1 or self.vector_outs[j] or
-                    outs[j][0][pos[j]] is not
-                      output_storage[offset_out + j].storage[0]):
+                    not output_reused[offset_out + j]):
                     outs[j][0][pos[j]] = \
                             output_storage[offset_out + j].storage[0]
 
@@ -1033,8 +1038,7 @@ class Scan(PureOp):
                         outs[j][0] = outs[j][0][:store_steps[j]]
                     outs[j][0][pos[j]] = output_storage[jout].storage[0]
                 elif (store_steps[j] == 1 or self.vector_outs[j] or
-                      outs[j][0][pos[j]] is not
-                      output_storage[j + offset_out].storage[0]):
+                      not output_reused[offset_out + j]):
                     outs[j][0][pos[j]] = \
                             output_storage[j + offset_out].storage[0]
 
@@ -1427,6 +1431,11 @@ class Scan(PureOp):
         else:
             grad_steps = inputs[0]
 
+        # Restrict the number of grad steps according to
+        # self.truncate_gradient
+        if self.truncate_gradient != -1:
+            grad_steps = tensor.minimum(grad_steps, self.truncate_gradient)
+
         rval = scan_utils.reconstruct_graph(self.inputs,
                                             self.outputs)
         self_inputs = rval[0]
@@ -1652,6 +1661,10 @@ class Scan(PureOp):
         outer_inp_seqs += [x[::-1][:-1] for x in self.outer_sitsot_outs(outs)]
         outer_inp_seqs += [x[::-1] for x in self.outer_nitsot_outs(outs)]
 
+        # Restrict the length of the outer sequences to the number of grad
+        # steps
+        outer_inp_seqs = [seq[:grad_steps] for seq in outer_inp_seqs]
+
         inner_inp_seqs = self.inner_seqs(self_inputs)
         inner_inp_seqs += self.inner_mitmot(self_inputs)
         inner_inp_seqs += self.inner_mitsot(self_inputs)
@@ -1724,9 +1737,12 @@ class Scan(PureOp):
 
         offset = self.n_mit_mot
         for idx in xrange(self.n_mit_sot):
+            if isinstance(dC_douts[idx + offset].type, DisconnectedType):
+                outer_inp_mitmot.append(outs[idx + offset].zeros_like())
+            else:
+                outer_inp_mitmot.append(dC_douts[idx + offset][::-1])
             mitmot_inp_taps.append([])
             mitmot_out_taps.append([])
-            outer_inp_mitmot.append(dC_douts[idx + offset][::-1])
             idx_tap = idx + self.n_mit_mot
             inner_inp_mitmot.append(dC_dXts[out_pos])
             out_pos += 1
@@ -1820,9 +1836,6 @@ class Scan(PureOp):
             ins_pos += 1
             n_mitmot_inps += 2
 
-        if self.truncate_gradient != -1:
-            grad_steps = tensor.minimum(grad_steps, self.truncate_gradient)
-
         n_nit_sot = self.n_seqs
         inner_out_nitsot = dC_dinps_t[:self.n_seqs]
         inner_out_sitsot = dC_dinps_t[ins_pos:]
@@ -1895,6 +1908,7 @@ class Scan(PureOp):
         else:
             info['name'] = None
         info['mode'] = self.mode
+        info['allow_gc'] = self.allow_gc
 
         outer_inputs = ([grad_steps] +
                         outer_inp_seqs +
@@ -2060,6 +2074,7 @@ class Scan(PureOp):
         else:
             info['name'] = None
         info['mode'] = self.mode
+        info['allow_gc'] = self.allow_gc
         info['mit_mot_out_slices'] = self.mit_mot_out_slices * 2
         info['destroy_map'] = OrderedDict()
         new_tap_array = []

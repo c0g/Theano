@@ -28,6 +28,14 @@ class GpuArrayType(Type):
             raise TypeError("Unsupported dtype for %s: %s" %
                             (self.__class__.__name__, self.dtype))
 
+    def clone(self, dtype=None, broadcastable=None):
+        if dtype is None:
+            dtype = self.dtype
+        if broadcastable is None:
+            broadcastable = self.broadcastable
+        return self.__class__(dtype=dtype, broadcastable=broadcastable,
+                              name=self.name)
+
     def __str__(self):
         return "GpuArrayType(%s, %s)" % (self.dtype, self.broadcastable)
 
@@ -139,6 +147,14 @@ class GpuArrayType(Type):
         return (type(self) == type(other) and
                 self.typecode == other.typecode and
                 self.broadcastable == other.broadcastable)
+
+    def convert_variable(self, var):
+        if (type(self) == type(var.type) and
+            self.typecode == var.type.typecode and
+            self.ndim == var.type.ndim and
+            all(sb == ob or ob for sb, ob in zip(self.broadcastable,
+                                                 var.type.broadcastable))):
+            return theano.tensor.patternbroadcast(var, self.broadcastable)
 
     def __hash__(self):
         return (hash(self.typecode) ^ hash(self.broadcastable))

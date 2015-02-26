@@ -256,9 +256,23 @@ class GpuElemwise(GpuOp):
         _inputs = [as_cuda_ndarray_variable(i) for i in inputs]
         if self.nin > 0 and len(_inputs) != self.nin:
             raise TypeError('Wrong argument count', (self.nin, len(_inputs)))
-        for i in _inputs[1:]:
-            if i.type.ndim != inputs[0].type.ndim:
-                raise TypeError('different ranks among inputs')
+
+        target_length = max([input.type.ndim for input in _inputs])
+
+        args = []
+        for input in _inputs:
+            length = input.type.ndim
+            difference = target_length - length
+            if not difference:
+                args.append(input)
+            else:
+                # TODO: use LComplete instead
+                args.append(GpuDimShuffle(
+                    input.type.broadcastable,
+                    ['x'] * difference + range(length)
+                    )(input))
+        _inputs = args
+
 
         # output is broadcastable only along dimensions where all
         # inputs are broadcastable
@@ -298,10 +312,12 @@ class GpuDimShuffle(GpuOp):
     """
     Implement DimShuffle on the gpu.
     """
+    check_broadcast = False
+
     def __init__(self, input_broadcastable, new_order):
         input_broadcastable = tuple(input_broadcastable)
         self.input_broadcastable = input_broadcastable
-        self.new_order = new_order
+        self.new_order = tuple(new_order)
 
         for i, b in enumerate(input_broadcastable):
             if i not in new_order:
@@ -310,6 +326,13 @@ class GpuDimShuffle(GpuOp):
                     raise ValueError("You cannot drop a non-broadcastable"
                                      " dimension.",
                                      (input_broadcastable, new_order))
+
+        # this is the list of the original dimensions that we keep
+        self.shuffle = [x for x in new_order if x != 'x']
+
+        # list of dimensions of the output that are broadcastable and were not
+        # in the original input
+        self.augment = [i for i, x in enumerate(new_order) if x == 'x']
 
         self.view_map = {0: [0]}
 
@@ -327,14 +350,22 @@ class GpuDimShuffle(GpuOp):
     def make_node(self, input):
         ib = tuple(input.type.broadcastable)
         if not ib == self.input_broadcastable:
-            raise TypeError(
-                "The number of dimensions and/or broadcastable pattern of the"
-                " input is incorrect for this op. Expected %s, got %s." %
-                (self.input_broadcastable, ib))
+            if len(ib) != len(self.input_broadcastable):
+                raise TypeError((
+                    "The number of dimensions of the "
+                    "input is incorrect for this op. Expected %s, got %s."
+                    % (self.input_broadcastable, ib)))
+            for expected, b in zip(self.input_broadcastable, ib):
+                if expected is True and b is False:
+                    raise TypeError((
+                        "The broadcastable pattern of the "
+                        "input is incorrect for this op. Expected %s, got %s."
+                        % (self.input_broadcastable, ib)))
+                #else, expected == b or expected is False and b is True
+                # Both case are good.
         ob = []
         if not isinstance(input.type, CudaNdarrayType):
-            raise TypeError("The input of a GpuDimshuffle must"
-                            " be a CudaNdarray")
+            input = as_cuda_ndarray_variable(input)
         for value in self.new_order:
             if value == 'x':
                 ob.append(True)
@@ -475,6 +506,17 @@ class GpuDimShuffle(GpuOp):
     def c_code_cache_version(self):
         return (1, 0)
 
+    def infer_shape(self, node, shapes):
+        ishp, = shapes
+        # transpose
+        rval = [ishp[i] for i in self.shuffle]
+
+        # augment
+        for augm in self.augment:
+            rval.insert(augm, 1)
+        return [rval]
+
+
 
 class GpuCAReduce(GpuOp):
     """GpuCAReduce is a Reduction along some dimensions by a scalar op.
@@ -552,6 +594,7 @@ class GpuCAReduce(GpuOp):
             self.pre_scalar_op = None
 
     def make_node(self, x):
+        x = as_cuda_ndarray_variable(x)
         if (x.type.ndim != len(self.reduce_mask)):
             raise TypeError("x must have rank %i" % len(self.reduce_mask))
         o_broadcast = [x.type.broadcastable[i] for i
@@ -2335,7 +2378,8 @@ class GpuReshape(tensor.Reshape, GpuOp):
                 shp = shp_new
 
             else:
-                raise ValueError("total size of new array must be unchanged")
+                raise ValueError("total size of new array must be unchanged",
+                                 x.shape, shp)
 
         out[0] = x.reshape(tuple(shp))
 
@@ -2344,6 +2388,8 @@ class GpuSubtensor(GpuOp, tensor.Subtensor):
     """
     Implement subtensor on the gpu.
     """
+    check_broadcast = False
+
     # __hash__, __eq__, __str__ come from tensor.Subtensor
     def make_node(self, x, *inputs):
         assert isinstance(x.type, CudaNdarrayType)
@@ -2710,7 +2756,7 @@ class GpuAdvancedIncSubtensor1_dev20(GpuAdvancedIncSubtensor1):
         return Apply(self, [x_, y_, ilist_], [x_.type()])
 
     def c_code_cache_version(self):
-        return (2,)
+        return (3,)
 
     def c_code(self, node, name, inputs, outputs, sub):
         active_device_no = theano.sandbox.cuda.active_device_number()
@@ -2736,7 +2782,9 @@ class GpuAdvancedIncSubtensor1_dev20(GpuAdvancedIncSubtensor1):
             Py_XINCREF(%(out)s);
         }
 
-        CudaNdarray_vector_add_fast(%(out)s, %(y)s, %(ind)s);
+        if (CudaNdarray_vector_add_fast(%(out)s, %(y)s, %(ind)s) != 0){
+            %(fail)s
+        }
 
         if (!%(out)s) {
             %(fail)s
@@ -2771,14 +2819,17 @@ class GpuAdvancedIncSubtensor1_dev20(GpuAdvancedIncSubtensor1):
              return;
         }
 
-	void CudaNdarray_vector_add_fast(CudaNdarray* py_self, CudaNdarray* py_other, PyArrayObject *indices_arr)
+        int CudaNdarray_vector_add_fast(CudaNdarray* py_self,
+            CudaNdarray* py_other, PyArrayObject *indices_arr)
 	{
      		const int *shapeX = CudaNdarray_HOST_DIMS(py_self);
      		const int *shapeY = CudaNdarray_HOST_DIMS(py_other);
      		const int *strX   = CudaNdarray_HOST_STRIDES(py_self);
      		const int *strY   = CudaNdarray_HOST_STRIDES(py_other);
-
      		unsigned int size = (unsigned int)PyArray_SIZE(indices_arr);
+                if(size == 0){
+                    return 0;
+                }
      		unsigned int numcolsX = shapeX[1];
      		unsigned int num_threads_per_block = std::min(numcolsX, (unsigned int)NUM_VECTOR_OP_THREADS_PER_BLOCK);
      		unsigned int num_blocks = std::min(size ,(unsigned int)NUM_VECTOR_OP_BLOCKS);
@@ -2786,18 +2837,23 @@ class GpuAdvancedIncSubtensor1_dev20(GpuAdvancedIncSubtensor1):
      		dim3 n_blocks(num_blocks);
      		dim3 n_threads(num_threads_per_block);
      		long *d_indices_arr = NULL;
-
      		PyArrayObject *cpu_indices_arr = PyArray_GETCONTIGUOUS(indices_arr);
-
      		d_indices_arr = (long*)device_malloc(PyArray_NBYTES(cpu_indices_arr));
-     		assert(d_indices_arr);
+
+                if(!d_indices_arr)
+                    return -1;
 
      		cudaError_t err = cudaMemcpy(d_indices_arr,
                                              PyArray_DATA(cpu_indices_arr),
                                              PyArray_NBYTES(cpu_indices_arr),
                                              cudaMemcpyHostToDevice);
-
-     		assert(err == cudaSuccess);
+                if(err != cudaSuccess){
+                    PyErr_Format(
+                        PyExc_RuntimeError,
+                        "GpuAdvancedIncSubtensor1_dev20: cudaMemcpy returned an error: %%s",
+                        cudaGetErrorString(err));
+                    return -1;
+                }
 
      		k_vector_add_fast<<<n_blocks, n_threads>>>(shapeX[0],
                                                            shapeX[1],
@@ -2812,12 +2868,20 @@ class GpuAdvancedIncSubtensor1_dev20(GpuAdvancedIncSubtensor1):
                                                            d_indices_arr,
                                                            PyArray_SIZE(indices_arr)
                                                           );
-     		device_free(d_indices_arr);
-     		Py_XDECREF(cpu_indices_arr);
-     		return;
-	}
+                device_free(d_indices_arr);
+                Py_XDECREF(cpu_indices_arr);
+                err = cudaGetLastError();
+                if(err != cudaSuccess){
+                    PyErr_Format(
+                        PyExc_RuntimeError,
+                        "GpuAdvancedIncSubtensor1_dev20: cuda error: %%s",
+                        cudaGetErrorString(err));
+                    return -1;
+                }
+                return 0;
+        }
 
-        """ %locals()
+        """ % locals()
 
 
 class GpuIncSubtensor(tensor.IncSubtensor, GpuOp):
@@ -3183,6 +3247,16 @@ class GpuJoin(tensor.Join, GpuOp):
 gpu_join = GpuJoin()
 
 
+class GpuSplit(tensor.Split, GpuOp):
+    def make_node(self, x, axis, splits):
+        x = as_cuda_ndarray_variable(x)
+        node = tensor.Split.make_node(self, x, axis, splits)
+        outs = [CudaNdarrayType(dtype=o.dtype,
+                                broadcastable=o.type.broadcastable)()
+                for o in node.outputs]
+        return Apply(self, [x] + node.inputs[1:], outs)
+
+
 class GpuAlloc(GpuOp):
     """Implement Alloc on the gpu.
 
@@ -3213,9 +3287,7 @@ class GpuAlloc(GpuOp):
         v = as_cuda_ndarray_variable(value)
         sh = [tensor.as_tensor_variable(s) for s in shape]
         if v.ndim != len(shape):
-            raise TypeError(
-                'GpuAlloc requires value of same dimensions as shape',
-                value, len(shape))
+            value = tensor.shape_padleft(value, len(shape) - v.ndim)
 
         bcast = []
         for s in sh:
@@ -3341,6 +3413,7 @@ class GpuContiguous(GpuOp):
     not already c contiguous.
     """
     view_map = {0: [0]}
+    check_input = False
 
     def __eq__(self, other):
         return type(self) == type(other)

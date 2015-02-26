@@ -16,6 +16,7 @@ from theano import sparse
 from theano import compile, config, gof
 from theano.sparse import enable_sparse
 from theano.gof.python25 import all, any, product
+from theano.gof.python25 import product as itertools_product
 from theano.tensor.basic import _allclose
 
 if not enable_sparse:
@@ -520,17 +521,18 @@ class T_AddMul(unittest.TestCase):
 
     def _testSS(self, op, array1=numpy.array([[1., 0], [3, 0], [0, 6]]),
                 array2=numpy.asarray([[0, 2.], [0, 4], [5, 0]])):
-        for mtype in _mtypes:
+        for mtype1, mtype2 in itertools_product(_mtypes, _mtypes):
             for dtype1, dtype2 in [('float64', 'int8'),
                                    ('int8', 'float64'),
+                                   ('float64', 'float64'),
                                ]:
-                a = mtype(array1).astype(dtype1)
+                a = mtype1(array1).astype(dtype1)
                 aR = as_sparse_variable(a)
                 self.assertFalse(aR.data is a)
                 self.assertTrue(_is_sparse(a))
                 self.assertTrue(_is_sparse_variable(aR))
 
-                b = mtype(array2).astype(dtype2)
+                b = mtype2(array2).astype(dtype2)
                 bR = as_sparse_variable(b)
                 self.assertFalse(bR.data is b)
                 self.assertTrue(_is_sparse(b))
@@ -540,7 +542,6 @@ class T_AddMul(unittest.TestCase):
                 self.assertTrue(_is_sparse_variable(apb))
 
                 self.assertTrue(apb.type.format == aR.type.format, apb.type.format)
-                self.assertTrue(apb.type.format == bR.type.format, apb.type.format)
 
                 val = eval_outputs([apb])
                 self.assertTrue(val.shape == (3, 2))
@@ -561,6 +562,8 @@ class T_AddMul(unittest.TestCase):
                       theano.shared(array1)]:
                 for dtype1, dtype2 in [('float64', 'int8'),
                                        ('int8', 'float64'),
+                                       # Needed to test the grad
+                                       ('float32', 'float64'),
                                    ]:
                     a = a.astype(dtype1)
                     b = mtype(array2).astype(dtype2)
@@ -580,6 +583,8 @@ class T_AddMul(unittest.TestCase):
                         self.assertTrue(numpy.all(val == ans))
                         if isinstance(a, theano.Constant):
                             a = a.data
+                        if getattr(a, 'owner', None):
+                            continue
                         if dtype1.startswith('float') and dtype2.startswith('float'):
                             verify_grad_sparse(op, [a, b], structured=True)
                     elif op is mul:
@@ -589,6 +594,8 @@ class T_AddMul(unittest.TestCase):
                             [[1, 0], [9, 0], [0, 36]])))
                         if isinstance(a, theano.Constant):
                             a = a.data
+                        if getattr(a, 'owner', None):
+                            continue
                         if dtype1.startswith('float') and dtype2.startswith('float'):
                             verify_grad_sparse(op, [a, b], structured=False)
 
@@ -1329,6 +1336,20 @@ class DotTests(utt.InferShapeTester):
         a = numpy.asarray(numpy.random.randint(0, 100, (size, size)),
                           dtype=intX)
         f(i, a)
+
+    def test_csr_dense_grad(self):
+
+        #shortcut: testing csc in float32, testing csr in float64
+
+        # allocate a random sparse matrix
+        spmat = sp.csr_matrix(random_lil((4, 3), 'float64', 3))
+
+        mat = numpy.asarray(numpy.random.randn(2, 4), 'float64')
+
+        def buildgraph_T(mat):
+            return Dot()(mat, spmat)
+
+        theano.tests.unittest_tools.verify_grad(buildgraph_T, [mat])
 
 
 class UsmmTests(unittest.TestCase):
@@ -2083,6 +2104,9 @@ class Test_getitem(unittest.TestCase):
         verify_grad_sparse(op_with_fixed_index, x_val)
 
     def test_GetItem2D(self):
+        scipy_ver = [int(n) for n in scipy.__version__.split('.')[:2]]
+        is_supported_version = bool(scipy_ver >= [0, 14])
+
         sparse_formats = ('csc', 'csr')
         for format in sparse_formats:
             x = theano.sparse.matrix(format, name='x')
@@ -2090,21 +2114,35 @@ class Test_getitem(unittest.TestCase):
             b = theano.tensor.iscalar('b')
             c = theano.tensor.iscalar('c')
             d = theano.tensor.iscalar('d')
+            e = theano.tensor.iscalar('e')
+            f = theano.tensor.iscalar('f')
 
             # index
             m = 1
             n = 5
             p = 10
             q = 15
+            if is_supported_version:
+                j = 2
+                k = 3
+            else:
+                j = None
+                k = None
 
             vx = as_sparse_format(self.rng.binomial(1, 0.5, (100, 97)),
-                                  format).astype(theano.config.floatX)
+                                      format).astype(theano.config.floatX)
+
             #mode_no_debug = theano.compile.mode.get_default_mode()
             #if isinstance(mode_no_debug, theano.compile.DebugMode):
             #    mode_no_debug = 'FAST_RUN'
-            f1 = theano.function([x, a, b, c, d], x[a:b, c:d])
-            r1 = f1(vx, m, n, p, q)
-            t1 = vx[m:n, p:q]
+            if is_supported_version:
+                f1 = theano.function([x, a, b, c, d, e, f], x[a:b:e, c:d:f])
+                r1 = f1(vx, m, n, p, q, j, k)
+                t1 = vx[m:n:j, p:q:k]
+            else:
+                f1 = theano.function([x, a, b, c, d], x[a:b, c:d])
+                r1 = f1(vx, m, n, p, q)
+                t1 = vx[m:n, p:q]
             assert r1.shape == t1.shape
             assert numpy.all(t1.toarray() == r1.toarray())
 
@@ -2139,32 +2177,41 @@ class Test_getitem(unittest.TestCase):
             assert r7.shape == t7.shape
             assert numpy.all(r7.toarray() == t7.toarray())
             """
-
-            f4 = theano.function([x, a, b], x[a:b])
-            r4 = f4(vx, m, n)
-            t4 = vx[m:n]
+            if is_supported_version:
+                f4 = theano.function([x, a, b, e], x[a:b:e])
+                r4 = f4(vx, m, n, j)
+                t4 = vx[m:n:j]
+            else:
+                f4 = theano.function([x, a, b], x[a:b])
+                r4 = f4(vx, m, n)
+                t4 = vx[m:n]
             assert r4.shape == t4.shape
             assert numpy.all(t4.toarray() == r4.toarray())
+
             #-----------------------------------------------------------
             # test cases using int indexing instead of theano variable
-
-            f6 = theano.function([x], x[1:10, 10:20])
+            f6 = theano.function([x], x[1:10:j, 10:20:k])
             r6 = f6(vx)
-            t6 = vx[1:10, 10:20]
+            t6 = vx[1:10:j, 10:20:k]
             assert r6.shape == t6.shape
             assert numpy.all(r6.toarray() == t6.toarray())
 
             #----------------------------------------------------------
             # test cases with indexing both with theano variable and int
-            f8 = theano.function([x, a, b], x[a:b, 10:20])
-            r8 = f8(vx, m, n)
-            t8 = vx[m:n, 10:20]
+            if is_supported_version:
+                f8 = theano.function([x, a, b, e], x[a:b:e, 10:20:1])
+                r8 = f8(vx, m, n, j)
+                t8 = vx[m:n:j, 10:20:1]
+            else:
+                f8 = theano.function([x, a, b], x[a:b, 10:20])
+                r8 = f8(vx, m, n)
+                t8 = vx[m:n, 10:20]
             assert r8.shape == t8.shape
             assert numpy.all(r8.toarray() == t8.toarray())
 
-            f9 = theano.function([x, a, b], x[1:a, 1:b])
+            f9 = theano.function([x, a, b], x[1:a:j, 1:b:k])
             r9 = f9(vx, p, q)
-            t9 = vx[1:p, 1:q]
+            t9 = vx[1:p:j, 1:q:k]
             assert r9.shape == t9.shape
             assert numpy.all(r9.toarray() == t9.toarray())
 
@@ -2200,11 +2247,14 @@ class Test_getitem(unittest.TestCase):
 
             # x[a:b:step, c:d] is not accepted because scipy silently drops
             # the step (!)
-            self.assertRaises(ValueError,
-                              x.__getitem__, (slice(a, b, -1), slice(c, d)))
-            self.assertRaises(ValueError,
-                              x.__getitem__, (slice(a, b), slice(c, d, 2)))
-
+            if not is_supported_version:
+                self.assertRaises(ValueError,
+                                  x.__getitem__, (slice(a, b, -1), slice(c, d)))
+                self.assertRaises(ValueError,
+                                  x.__getitem__, (slice(a, b), slice(c, d, 2)))
+            else:
+                raise SkipTest("Slicing with step is supported.")
+                
             # Advanced indexing is not supported
             self.assertRaises(ValueError,
                               x.__getitem__,
@@ -2322,7 +2372,7 @@ class CastTester(utt.InferShapeTester):
 
                     eps = None
                     if o_dtype == 'float32':
-                        eps = 7e-4
+                        eps = 1e-2
 
                     verify_grad_sparse(Cast(o_dtype), data, eps=eps)
 
@@ -2336,8 +2386,7 @@ def _format_info(nb):
         spa = getattr(sp, format + '_matrix')
 
         x[format] = [variable() for t in range(nb)]
-        mat[format] = [spa(numpy.random.random_integers(5, size=(3, 4)) - 1,
-                           dtype=theano.config.floatX)
+        mat[format] = [spa(random_lil((3, 4), theano.config.floatX, 8))
                        for t in range(nb)]
     return x, mat
 
@@ -2386,7 +2435,8 @@ class _HVStackTester(utt.InferShapeTester):
                         self.op_class(format=out_f, dtype=dtype),
                         self.mat[format],
                         structured=False,
-                        eps=7e-4)
+                        eps=1e-2,
+                        )
 
 
 def _hv_switch(op, expected_function):
